@@ -114,6 +114,7 @@ Run `kseal <command> --help` for every flag.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test                 # the sealing interop test also runs if `go` is on PATH
+scripts/e2e-kind.sh        # opt-in: throwaway KinD cluster + real sealed-secrets controller
 ```
 
 Pure logic lives in `src/core.rs` (tested). The TUI in `src/tui/` is

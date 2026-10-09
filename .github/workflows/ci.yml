@@ -8,6 +8,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      e2e:
+        description: Also run the KinD + sealed-secrets end-to-end test
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,3 +56,20 @@ jobs:
       - run: cargo test --locked
         env:
           KSEAL_REQUIRE_GO: "1"
+
+  # Opt-in: a throwaway KinD cluster with the real sealed-secrets controller.
+  # Runs on manual dispatch (tick "e2e") or on PRs labelled `e2e`.
+  e2e:
+    name: e2e (KinD + sealed-secrets)
+    if: >
+      (github.event_name == 'workflow_dispatch' && inputs.e2e) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - run: scripts/e2e-kind.sh
