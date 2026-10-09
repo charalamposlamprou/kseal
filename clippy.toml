@@ -1,0 +1,12 @@
+# kseal is read-only against the cluster. Any of these appearing in the code
+# is a bug — CI runs `cargo clippy -- -D warnings`, so it fails the build.
+disallowed-methods = [
+  { path = "kube::Api::create", reason = "kseal is read-only against the cluster" },
+  { path = "kube::Api::replace", reason = "kseal is read-only against the cluster" },
+  { path = "kube::Api::patch", reason = "kseal is read-only against the cluster" },
+  { path = "kube::Api::patch_metadata", reason = "kseal is read-only against the cluster" },
+  { path = "kube::Api::patch_status", reason = "kseal is read-only against the cluster" },
+  { path = "kube::Api::replace_status", reason = "kseal is read-only against the cluster" },
+  { path = "kube::Api::delete", reason = "kseal is read-only against the cluster" },
+  { path = "kube::Api::delete_collection", reason = "kseal is read-only against the cluster" },
+]
