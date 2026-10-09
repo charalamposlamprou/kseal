@@ -4,6 +4,7 @@ name: Publish Homebrew formula
 # generated formula to Formula/ in THIS repo with the built-in GITHUB_TOKEN,
 # so no personal token is needed. Users install with:
 #   brew tap charalamposlamprou/kseal https://github.com/charalamposlamprou/kseal
+#   brew trust charalamposlamprou/kseal
 #   brew install kseal
 on:
   workflow_call:

@@ -23,6 +23,7 @@ binary. kseal ships as one static binary with a TUI and scriptable subcommands.
 
 ```bash
 brew tap charalamposlamprou/kseal https://github.com/charalamposlamprou/kseal
+brew trust charalamposlamprou/kseal     # Homebrew asks once for third-party taps
 brew install kseal
 ```
 
