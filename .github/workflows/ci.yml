@@ -1,11 +1,10 @@
 name: CI
 
-# Lint and test on every PR (and pushes to main). Make the jobs required
-# status checks in branch protection so a PR can't merge until they pass.
+# Checks run on pull requests only; releasing happens on merge, in
+# tag-on-merge.yml. Pushes to main (merges, the release bot's version bump
+# and formula commits) don't re-run them. Run by hand from the Actions tab.
 on:
   pull_request:
-    branches: [main]
-  push:
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -16,6 +15,11 @@ on:
 
 permissions:
   contents: read
+
+# A new push to a PR supersedes its in-progress run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,6 +34,20 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+
+  # The release config: dist can plan a release, and release.yml matches
+  # dist-workspace.toml (so a merge won't fail to release).
+  dist:
+    name: dist plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dist (version pinned in dist-workspace.toml)
+        run: |
+          ver="$(sed -nE 's/^cargo-dist-version = "([^"]+)"/\1/p' dist-workspace.toml)"
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${ver}/cargo-dist-installer.sh" | sh
+      - run: dist generate --check
+      - run: dist plan
 
   test:
     name: clippy + test (${{ matrix.os }})

@@ -19,6 +19,8 @@ publish-jobs = ["./publish-homebrew"]
 # Releases are started by tag-on-merge.yml via workflow_dispatch (a tag pushed
 # with GITHUB_TOKEN can't trigger a workflow; a dispatch can).
 dispatch-releases = true
+# Don't run release.yml on PRs; ci.yml's `dist` job checks the release config.
+pr-run-mode = "skip"
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "aarch64-apple-darwin",
