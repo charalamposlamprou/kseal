@@ -22,7 +22,8 @@ binary. kseal ships as one static binary with a TUI and scriptable subcommands.
 **Homebrew** (macOS, Linux)
 
 ```bash
-brew install charalamposlamprou/tap/kseal
+brew tap charalamposlamprou/kseal https://github.com/charalamposlamprou/kseal
+brew install kseal
 ```
 
 **Shell installer** (macOS, Linux)
@@ -126,19 +127,17 @@ Elm-style: `app.rs` holds the state and update logic and never does I/O,
 Every PR merged into `main` cuts a release; the default bump is patch. Label
 the PR `release:minor` or `release:major` to bump higher, or `release:skip`
 to merge without releasing. `tag-on-merge.yml` bumps `Cargo.toml` to the new
-version, commits it to `main` and pushes the `vX.Y.Z` tag. That tag triggers
-`release.yml` ([dist](https://github.com/axodotdev/cargo-dist)), which builds
-every target and publishes the GitHub release, installers and Homebrew formula.
+version, commits it to `main`, pushes the `vX.Y.Z` tag and starts
+`release.yml` ([dist](https://github.com/axodotdev/cargo-dist)). That builds
+every target and publishes the GitHub release and installers, then
+`publish-homebrew.yml` commits the updated formula to `Formula/` in this repo.
 
-Repository secrets:
+No secrets are needed: everything runs on the built-in `GITHUB_TOKEN`. If
+`main` is protected, allow GitHub Actions to push to it (the version bump and
+the formula are committed there).
 
-- `RELEASE_TOKEN`: a fine-grained PAT with **Contents: read and write** on
-  this repo. Tags pushed with the default `GITHUB_TOKEN` don't trigger other
-  workflows. If `main` is protected, the token's owner must be allowed to push.
-- `HOMEBREW_TAP_TOKEN`: a fine-grained PAT with **Contents: read and write**
-  on `charalamposlamprou/homebrew-tap`.
-
-One token scoped to both repositories can serve as both secrets.
+To release by hand, push a version tag that matches `Cargo.toml`, then run
+`gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z`.
 
 ## License
 

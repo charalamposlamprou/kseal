@@ -1,10 +1,10 @@
 [workspace]
 members = ["cargo:."]
 
-# Config for `dist` (cargo-dist): on every vX.Y.Z tag, build every target
-# below, publish a GitHub release with shell / PowerShell / MSI installers,
-# and push a formula to the Homebrew tap. The tag is pushed by
-# .github/workflows/tag-on-merge.yml when a PR is merged.
+# Config for `dist` (cargo-dist): for each vX.Y.Z release, build every target
+# below and publish a GitHub release with shell / PowerShell / MSI installers
+# and a Homebrew formula. .github/workflows/tag-on-merge.yml pushes the tag
+# and dispatches release.yml when a PR is merged.
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.30.0"
@@ -12,10 +12,13 @@ cargo-dist-version = "0.30.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell", "powershell", "homebrew", "msi"]
-# A GitHub repo to push Homebrew formulas to (needs the HOMEBREW_TAP_TOKEN secret)
-tap = "charalamposlamprou/homebrew-tap"
-# Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+# Publish jobs to run in CI. The Homebrew formula is committed to THIS repo
+# (Formula/kseal.rb) by our own job, using the built-in GITHUB_TOKEN — so no
+# personal token is needed. Users: brew tap charalamposlamprou/kseal <repo url>
+publish-jobs = ["./publish-homebrew"]
+# Releases are started by tag-on-merge.yml via workflow_dispatch (a tag pushed
+# with GITHUB_TOKEN can't trigger a workflow; a dispatch can).
+dispatch-releases = true
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "aarch64-apple-darwin",
@@ -35,3 +38,7 @@ install-updater = false
 [dist.github-custom-runners]
 aarch64-apple-darwin = "macos-14"
 x86_64-apple-darwin = "macos-14"
+
+# The Homebrew job commits Formula/kseal.rb to this repo, so it needs to push.
+[dist.github-custom-job-permissions]
+"publish-homebrew" = { contents = "write" }

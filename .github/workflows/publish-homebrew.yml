@@ -1,0 +1,59 @@
+name: Publish Homebrew formula
+
+# Called by release.yml (dist) after the GitHub release exists. Commits the
+# generated formula to Formula/ in THIS repo with the built-in GITHUB_TOKEN,
+# so no personal token is needed. Users install with:
+#   brew tap charalamposlamprou/kseal https://github.com/charalamposlamprou/kseal
+#   brew install kseal
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  formula:
+    name: Commit Formula/
+    runs-on: ubuntu-latest
+    env:
+      PLAN: ${{ inputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      # The release artifacts include the formula; keep them out of the tree.
+      - name: Fetch release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: ${{ runner.temp }}/artifacts
+          merge-multiple: true
+      - name: Commit and push the formula
+        env:
+          ARTIFACTS: ${{ runner.temp }}/artifacts
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          mkdir -p Formula
+
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
+            filename=$(echo "$release" | jq --raw-output '.artifacts[] | select(endswith(".rb"))')
+            version=$(echo "$release" | jq --raw-output .app_version)
+            cp "$ARTIFACTS/$filename" "Formula/$filename"
+            # Don't reformat user-provided data such as the description.
+            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/$filename" || true
+            git add "Formula/$filename"
+            git commit -m "Formula: ${filename%.rb} ${version} [skip ci]" || echo "formula unchanged"
+          done
+
+          # A PR may have merged since checkout: rebase and retry.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then exit 0; fi
+            echo "push rejected (attempt $attempt) — rebasing on main"
+            git pull --rebase origin main
+          done
+          exit 1
