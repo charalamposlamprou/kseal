@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Terminal UI + CLI for Kubernetes Secrets: base64 encode/decode, .env → Secret YAML, and native SealedSecret sealing — read-only against the cluster."
+authors = ["Charalampos Lamprou"]
 license = "MIT"
 repository = "https://github.com/charalamposlamprou/kseal"
 homepage = "https://github.com/charalamposlamprou/kseal"
@@ -47,25 +48,11 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# The config file for `dist` (cargo-dist): builds every target below on each
-# vX.Y.Z tag, publishes a GitHub release with shell/PowerShell installers, and
-# pushes a formula to the Homebrew tap.
 [profile.dist]
 inherits = "release"
 
-[package.metadata.dist]
-cargo-dist-version = "0.30.0"
-ci = "github"
-installers = ["shell", "powershell", "homebrew", "msi"]
-tap = "charalamposlamprou/homebrew-tap"
-publish-jobs = ["homebrew"]
-targets = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-musl",
-  "x86_64-unknown-linux-musl",
-  "x86_64-unknown-linux-gnu",
-  "x86_64-pc-windows-msvc",
-]
-install-path = "CARGO_HOME"
-install-updater = false
+[package.metadata.wix]
+upgrade-guid = "A605AC27-5D2E-4D4E-A372-71710673D163"
+path-guid = "9C68C058-DAC6-4857-9C17-164D3DC0FF44"
+license = false
+eula = false

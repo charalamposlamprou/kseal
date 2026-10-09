@@ -354,6 +354,8 @@ pub(crate) mod tests {
     fn interop_with_go_hybrid_decrypt() {
         use rsa::pkcs1::EncodeRsaPrivateKey;
         if std::process::Command::new("go").arg("version").output().is_err() {
+            // CI sets this so a missing Go fails loudly instead of skipping.
+            assert!(std::env::var_os("KSEAL_REQUIRE_GO").is_none(), "KSEAL_REQUIRE_GO is set but go is not on PATH");
             eprintln!("skipping: go not installed");
             return;
         }

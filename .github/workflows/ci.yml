@@ -1,0 +1,53 @@
+name: CI
+
+# Lint and test on every PR (and pushes to main). Make the jobs required
+# status checks in branch protection so a PR can't merge until they pass.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  test:
+    name: clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The sealing interop test decrypts with Go's crypto/rsa + crypto/cipher,
+      # the primitives sealed-secrets itself uses.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      # Per OS, because unix/windows code paths differ. clippy.toml bans the
+      # mutating kube::Api methods: kseal stays read-only against the cluster.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+        env:
+          KSEAL_REQUIRE_GO: "1"

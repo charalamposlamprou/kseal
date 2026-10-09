@@ -1,0 +1,123 @@
+name: Tag release on merge
+
+# Every merged PR into main cuts a release. The bump defaults to patch;
+# add a label to size it explicitly:
+#   release:patch   v1.2.3 -> v1.2.4   (same as no label)
+#   release:minor   v1.2.3 -> v1.3.0
+#   release:major   v1.2.3 -> v2.0.0
+# To merge WITHOUT releasing, add the `release:skip` label.
+#
+# This job only decides the version: it bumps Cargo.toml / Cargo.lock to
+# match (dist refuses a tag that disagrees with the crate version), commits
+# that to main and pushes the vX.Y.Z tag. The tag push triggers release.yml
+# (dist), which builds every target and publishes the GitHub release, the
+# installers and the Homebrew formula.
+#
+# Needs the RELEASE_TOKEN secret: a tag pushed with the default GITHUB_TOKEN
+# does not trigger other workflows, so dist would never run.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+# Serialize releases so two label-merged PRs can't compute the same next
+# version and collide on the tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Bump version and push tag
+    if: >
+      github.event.pull_request.merged == true &&
+      !contains(github.event.pull_request.labels.*.name, 'release:skip')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require RELEASE_TOKEN
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::error::Set the RELEASE_TOKEN secret (a PAT with contents:write on this repo) — see README → Releasing."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compute next version
+        id: version
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+
+          # Pick the bump level from the PR labels (major beats minor beats patch).
+          if echo "$LABELS" | grep -q 'release:major'; then bump="major"
+          elif echo "$LABELS" | grep -q 'release:minor'; then bump="minor"
+          else bump="patch"
+          fi
+
+          latest="$(git tag --list 'v*.*.*' --sort=-v:refname | head -n1)"
+          if [ -z "$latest" ]; then
+            # First release: ship the version Cargo.toml already declares.
+            next="v$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n1)"
+            echo "No tags yet — first release is $next"
+          else
+            echo "Latest tag: $latest (bump: $bump)"
+            ver="${latest#v}"
+            major="${ver%%.*}"
+            rest="${ver#*.}"
+            minor="${rest%%.*}"
+            patch="${rest#*.}"
+            patch="${patch%%[-+]*}"
+            case "$bump" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            next="v${major}.${minor}.${patch}"
+          fi
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+            echo "::error::$next already exists"
+            exit 1
+          fi
+          echo "Next version: $next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Bump Cargo.toml and Cargo.lock
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          # Only the [package] version — the first `version = ` line.
+          sed -i -E "0,/^version = \".*\"/s//version = \"${ver}\"/" Cargo.toml
+          cargo update --workspace --offline
+          git diff --stat
+
+      - name: Commit, tag and push
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet; then
+            git commit -am "release: ${TAG} (#${PR})"
+            git push origin HEAD:main
+          fi
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
