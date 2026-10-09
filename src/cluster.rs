@@ -34,9 +34,12 @@ pub fn list_contexts() -> Result<Contexts> {
 /// context's default namespace.
 pub async fn client_for(context: Option<&str>) -> Result<(Client, String)> {
     let opts = KubeConfigOptions { context: context.map(str::to_owned), ..Default::default() };
-    let cfg = Config::from_kubeconfig(&opts)
+    let mut cfg = Config::from_kubeconfig(&opts)
         .await
         .with_context(|| format!("loading kubeconfig context {}", context.unwrap_or("(current)")))?;
+    // kube's default retry backs off up to 15 times on 503 — minutes for an
+    // error that's permanent here (e.g. "no endpoints"). Fail fast instead.
+    cfg.default_retry = false;
     let ns = cfg.default_namespace.clone();
     Ok((Client::try_from(cfg)?, ns))
 }
@@ -100,14 +103,29 @@ pub async fn detect_controller(client: &Client) -> Result<Option<(String, String
     }
 }
 
-fn proxy_path(ns: &str, svc: &str, suffix: &str) -> String {
-    // `http:<name>:` = scheme http, first port — what kubeseal uses.
-    format!("/api/v1/namespaces/{ns}/services/http:{svc}:/proxy{suffix}")
+/// The port to proxy to, resolved like kubeseal: the service's first port,
+/// by name when it has one. Helm names it `http`, and the API server matches
+/// an empty port only against an UNNAMED port ("no endpoints available").
+fn service_port(svc: &Service) -> String {
+    let first = svc.spec.as_ref().and_then(|s| s.ports.as_ref()).and_then(|p| p.first());
+    first.map_or_else(String::new, |p| p.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| p.port.to_string()))
+}
+
+fn proxy_path_for(ns: &str, svc: &str, port: &str, suffix: &str) -> String {
+    format!("/api/v1/namespaces/{ns}/services/http:{svc}:{port}/proxy{suffix}")
+}
+
+async fn proxy_path(client: &Client, ns: &str, svc: &str, suffix: &str) -> String {
+    let api: Api<Service> = Api::namespaced(client.clone(), ns);
+    // If the Service can't be read (RBAC), fall back to the first-port form;
+    // the proxy request itself then reports the real problem.
+    let port = api.get(svc).await.map(|s| service_port(&s)).unwrap_or_default();
+    proxy_path_for(ns, svc, &port, suffix)
 }
 
 /// The controller's current sealing certificate (PEM).
 pub async fn fetch_cert(client: &Client, ns: &str, svc: &str) -> Result<Vec<u8>> {
-    let req = http::Request::get(proxy_path(ns, svc, "/v1/cert.pem")).body(Vec::new())?;
+    let req = http::Request::get(proxy_path(client, ns, svc, "/v1/cert.pem").await).body(Vec::new())?;
     let pem = client
         .request_text(req)
         .await
@@ -117,12 +135,40 @@ pub async fn fetch_cert(client: &Client, ns: &str, svc: &str) -> Result<Vec<u8>>
 
 /// Ask the controller whether it can decrypt `sealed`. Creates nothing.
 pub async fn verify(client: &Client, ns: &str, svc: &str, sealed: &Value) -> Result<bool> {
-    let req = http::Request::post(proxy_path(ns, svc, "/v1/verify"))
+    let req = http::Request::post(proxy_path(client, ns, svc, "/v1/verify").await)
         .header("Content-Type", "application/json")
         .body(serde_json::to_vec(sealed)?)?;
     match client.request_text(req).await {
         Ok(_) => Ok(true),
         Err(kube::Error::Api(e)) if e.code == 409 => Ok(false),
         Err(e) => Err(anyhow!(e).context(format!("verifying against {ns}/{svc}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
+
+    fn svc(ports: Vec<(Option<&str>, i32)>) -> Service {
+        let ports = ports
+            .into_iter()
+            .map(|(name, port)| ServicePort { name: name.map(Into::into), port, ..Default::default() })
+            .collect();
+        Service { spec: Some(ServiceSpec { ports: Some(ports), ..Default::default() }), ..Default::default() }
+    }
+
+    #[test]
+    fn proxy_port_matches_kubeseal() {
+        // Helm chart: named port — an empty port would get "no endpoints available".
+        assert_eq!(service_port(&svc(vec![(Some("http"), 8080), (Some("metrics"), 8081)])), "http");
+        // Upstream controller.yaml: unnamed port.
+        assert_eq!(service_port(&svc(vec![(None, 8080)])), "8080");
+        assert_eq!(service_port(&svc(vec![(Some(""), 8080)])), "8080");
+        assert_eq!(service_port(&Service::default()), "");
+        assert_eq!(
+            proxy_path_for("sealed-secrets", "sealed-secrets-controller", "http", "/v1/cert.pem"),
+            "/api/v1/namespaces/sealed-secrets/services/http:sealed-secrets-controller:http/proxy/v1/cert.pem"
+        );
     }
 }

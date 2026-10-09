@@ -168,6 +168,31 @@ else
   ok "validate rejects a renamed strict SealedSecret"
 fi
 
+# Helm installs name the service port ("http"); the upstream manifest above
+# leaves it unnamed. Expose the same controller with a named port and make
+# sure cert fetch + verify still resolve it (kubeseal-compatible).
+echo "e2e: controller behind a named service port (Helm-style)"
+# shellcheck disable=SC2016 # a go-template, not shell
+sel="$(kubectl -n kube-system get svc sealed-secrets-controller -o go-template='{{range $k, $v := .spec.selector}}{{$k}}={{$v}},{{end}}')"
+kubectl -n kube-system create service clusterip sealed-secrets-named --tcp=8080:8080 >/dev/null
+kubectl -n kube-system set selector svc sealed-secrets-named "${sel%,}" >/dev/null
+named_ok=0
+for _ in $(seq 1 30); do
+  if "$KSEAL" validate -f "$WORK/e2e-strict.sealed.yaml" --context "$CTX" \
+    --controller-name sealed-secrets-named --controller-namespace kube-system 2>/dev/null; then
+    named_ok=1
+    break
+  fi
+  sleep 1
+done
+if [ "$named_ok" = 1 ]; then ok "validate via a named port"; else bad "validate via a named port"; fi
+if "$KSEAL" cert --context "$CTX" --controller-name sealed-secrets-named --controller-namespace kube-system |
+  grep -q "BEGIN CERTIFICATE"; then
+  ok "cert via a named port"
+else
+  bad "cert via a named port"
+fi
+
 # kseal itself only reads: its own fetch must agree with what kubectl sees.
 if [ "$("$KSEAL" get e2e-strict -n e2e-a --context "$CTX" --format env | grep -c .)" -eq "$NKEYS" ]; then
   ok "kseal get reads the unsealed Secret"
