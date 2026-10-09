@@ -35,6 +35,20 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  # The release config: dist can plan a release, and release.yml matches
+  # dist-workspace.toml (so a merge won't fail to release).
+  dist:
+    name: dist plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dist (version pinned in dist-workspace.toml)
+        run: |
+          ver="$(sed -nE 's/^cargo-dist-version = "([^"]+)"/\1/p' dist-workspace.toml)"
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${ver}/cargo-dist-installer.sh" | sh
+      - run: dist generate --check
+      - run: dist plan
+
   test:
     name: clippy + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
