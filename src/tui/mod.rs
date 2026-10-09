@@ -309,6 +309,7 @@ fn private_temp_dir() -> Result<PathBuf> {
     for i in 0..16u32 {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
         let dir = base.join(format!("kseal-{}-{nanos}-{i}", std::process::id()));
+        #[cfg_attr(not(unix), allow(unused_mut))] // only unix sets a mode
         let mut b = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
