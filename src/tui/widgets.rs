@@ -27,6 +27,12 @@ impl Input {
     pub fn clear(&mut self) {
         self.set("");
     }
+    pub fn at_start(&self) -> bool {
+        self.cursor == 0
+    }
+    pub fn at_end(&self) -> bool {
+        self.cursor == self.value.chars().count()
+    }
     fn byte_at(&self, char_idx: usize) -> usize {
         self.value.char_indices().nth(char_idx).map_or(self.value.len(), |(i, _)| i)
     }

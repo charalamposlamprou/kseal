@@ -508,7 +508,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 "Enter pick · Ctrl+L load from cluster · Ctrl+R reload contexts"
             }
             Focus::SecType => "Enter pick (or type a custom type) · Ctrl+G generate",
-            Focus::SealCtx | Focus::Scope => "Enter pick · ←→ cycle scope · Ctrl+E seal · Ctrl+T validate",
+            Focus::SealCtx | Focus::Scope => "Enter pick · Ctrl+E seal · Ctrl+T validate",
             Focus::Rows => {
                 "a add · d delete · Enter edit · e $EDITOR · v/V show · Ctrl+Y copy value · Ctrl+K clear all"
             }
@@ -519,7 +519,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Focus::Cert => "Ctrl+O pick a cert · Ctrl+K clear",
         },
     };
-    let right = "Tab focus · F1-F3 tabs · ? help · Ctrl+Q quit ";
+    let right = "↑↓←→ move · F1-F3 tabs · ? help · Ctrl+Q quit ";
     let [l, r] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right.chars().count() as u16)]).areas(area);
     f.render_widget(Paragraph::new(format!(" {hints}")).style(Style::new().bg(t.bg3).fg(t.dim)), l);
@@ -621,7 +621,8 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
             let h = |s: &'static str| Line::styled(s, Style::new().fg(t.fg).bold());
             let lines = vec![
                 h("Anywhere"),
-                k("Tab / Shift-Tab", "move focus"),
+                k("↑ ↓ ← →", "move between fields (tables, panes and text first)"),
+                k("Tab / Shift-Tab", "next / previous field"),
                 k("F1 F2 F3", "Encode / Decode / Seal  (also Ctrl+N / Ctrl+P)"),
                 k("Ctrl+G", "generate Secret YAML from the rows"),
                 k("Ctrl+O", "open file: .env or Secret YAML (Seal tab: certificate)"),
@@ -635,7 +636,7 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 k("Ctrl+C / Ctrl+Q", "quit"),
                 Line::raw(""),
                 h("Key tables"),
-                k("↑↓ PgUp PgDn", "move"),
+                k("↑↓ PgUp PgDn", "move (↑/↓ at the edge leaves the table)"),
                 k("a / d", "add / delete a row"),
                 k("Enter", "edit the row"),
                 k("e", "edit the value in $EDITOR (multi-line)"),
