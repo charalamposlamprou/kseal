@@ -218,6 +218,27 @@ fn field(f: &mut Frame, area: Rect, label: &str, label_w: u16, content: Content,
     cursor
 }
 
+const BUTTON_W: u16 = 15;
+
+/// Split a field row so a key "button" sits at its right edge.
+fn with_button(area: Rect) -> (Rect, Rect) {
+    let [field, _, button] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(1), Constraint::Length(BUTTON_W)]).areas(area);
+    (field, button)
+}
+
+fn show_label(shown: bool) -> &'static str {
+    if shown { "Ctrl+X hide" } else { "Ctrl+X show" }
+}
+
+/// A button-looking label naming the key that does it (the TUI has no mouse).
+fn key_button(f: &mut Frame, area: Rect, label: &str, active: bool) {
+    let t = theme();
+    let style =
+        if active { Style::new().bg(t.field_focus).fg(t.accent).bold() } else { Style::new().bg(t.bg3).fg(t.dim) };
+    f.render_widget(Paragraph::new(label.to_string()).style(style).centered(), area);
+}
+
 fn truncate(s: &str, w: usize) -> String {
     let s = one_line(s);
     if s.chars().count() <= w {
@@ -260,10 +281,15 @@ fn draw_encode(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Positi
 
     heading(f, h1, "Single value encoder", None);
     let sv_in = Content::Input { input: &app.sv_in, masked: !app.sv_shown, placeholder: "type or paste a value" };
+    let sv_focus = matches!(fo, Focus::SvIn | Focus::SvOut);
+    let (sv1, b1) = with_button(sv1);
+    let (sv2, b2) = with_button(sv2);
     *cur = field(f, sv1, "Value", LABEL_W, sv_in, fo == Focus::SvIn).or(*cur);
+    key_button(f, b1, show_label(app.sv_shown), sv_focus);
     let enc = app.sv_encoded();
     let out = Content::Text(masked(&enc, app.sv_shown), Style::new().fg(t.blue));
     field(f, sv2, "Base64", LABEL_W, out, fo == Focus::SvOut);
+    key_button(f, b2, "Ctrl+Y copy", sv_focus);
     separator(f, sep);
 
     let file = Line::from(vec![
@@ -347,12 +373,17 @@ fn draw_decode(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Positi
 
     heading(f, h1, "Single value decoder", None);
     let dv_in = Content::Input { input: &app.dv_in, masked: false, placeholder: "paste base64" };
+    let dv_focus = matches!(fo, Focus::DvIn | Focus::DvOut);
+    let (dv1, b1) = with_button(dv1);
+    let (dv2, b2) = with_button(dv2);
     *cur = field(f, dv1, "Base64", LABEL_W, dv_in, fo == Focus::DvIn).or(*cur);
+    key_button(f, b1, "Ctrl+K clear", dv_focus);
     let out = match app.dv_decoded() {
         Ok(s) => Content::Text(masked(&s, app.dv_shown), Style::new().fg(t.blue)),
         Err(e) => Content::Text(e, Style::new().fg(t.err)),
     };
     field(f, dv2, "Decoded", LABEL_W, out, fo == Focus::DvOut);
+    key_button(f, b2, show_label(app.dv_shown), dv_focus);
     separator(f, sep);
 
     let file = Line::from(vec![
@@ -656,6 +687,10 @@ mod tests {
         let s = render(&mut app, 120, 40);
         assert!(s.contains("Single value encoder") && s.contains("Secret YAML") && s.contains("Keys"));
         assert!(!s.contains("hunter2") && !s.contains("aHVudGVyMg=="), "values are masked by default");
+        assert!(s.contains("Ctrl+X show"), "the reveal key is visible next to the field");
+        app.sv_shown = true;
+        let s = render(&mut app, 120, 40);
+        assert!(s.contains("hunter2") && s.contains("aHVudGVyMg==") && s.contains("Ctrl+X hide"));
     }
 
     #[test]
