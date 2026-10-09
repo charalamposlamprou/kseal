@@ -163,10 +163,9 @@ async fn controller(client: &kube::Client, ctl: &ControllerArgs) -> Result<(Stri
     }
     let found = cluster::detect_controller(client).await?;
     match found {
-        Some((ns, name)) => Ok((
-            ctl.controller_namespace.clone().unwrap_or(ns),
-            ctl.controller_name.clone().unwrap_or(name),
-        )),
+        Some((ns, name)) => {
+            Ok((ctl.controller_namespace.clone().unwrap_or(ns), ctl.controller_name.clone().unwrap_or(name)))
+        }
         None => bail!("no sealed-secrets controller found — pass --controller-name/--controller-namespace or --cert"),
     }
 }
@@ -228,8 +227,16 @@ async fn run(cmd: Cmd) -> Result<()> {
                 GetFormat::Yaml => {
                     let (carry, skipped) = core::secret_carryover(&doc);
                     let (n, ns, t) = core::secret_identity(&doc);
-                    let text: Vec<_> = entries.iter().filter(|e| e.kind == EntryKind::Text).map(|e| (e.key.clone(), e.value.clone())).collect();
-                    let raw: Vec<_> = entries.iter().filter(|e| e.kind != EntryKind::Text).map(|e| (e.key.clone(), e.value.clone())).collect();
+                    let text: Vec<_> = entries
+                        .iter()
+                        .filter(|e| e.kind == EntryKind::Text)
+                        .map(|e| (e.key.clone(), e.value.clone()))
+                        .collect();
+                    let raw: Vec<_> = entries
+                        .iter()
+                        .filter(|e| e.kind != EntryKind::Text)
+                        .map(|e| (e.key.clone(), e.value.clone()))
+                        .collect();
                     print!("{}", core::build_secret_yaml(&n, &ns, &text, &t, &raw, &carry));
                     if skipped > 0 {
                         eprintln!("warning: {skipped} malformed metadata field(s) dropped");
@@ -262,7 +269,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             if cluster::verify(&client, &ns, &name, sealed).await? {
                 eprintln!("✓ controller {ns}/{name} can decrypt this SealedSecret");
             } else {
-                bail!("✗ controller {ns}/{name} cannot decrypt this SealedSecret (wrong key, scope, name or namespace)");
+                bail!(
+                    "✗ controller {ns}/{name} cannot decrypt this SealedSecret (wrong key, scope, name or namespace)"
+                );
             }
         }
         Cmd::Cert { kube, ctl } => {

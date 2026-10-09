@@ -74,16 +74,15 @@ pub fn hybrid_encrypt(pubkey: &RsaPublicKey, plaintext: &[u8], label: &[u8]) -> 
     let mut session_key = [0u8; 32];
     rng.fill_bytes(&mut session_key);
 
-    let padding = Oaep::new_with_label::<Sha256, _>(String::from_utf8_lossy(label).into_owned());
+    let padding = Oaep::new_with_label::<Sha256, _>(&String::from_utf8_lossy(label));
     // Labels are always UTF-8 (namespace/name), so the lossy conversion above
     // is exact; assert it so a future change can't silently alter the label.
     debug_assert_eq!(String::from_utf8_lossy(label).as_bytes(), label);
     let rsa_ct = pubkey.encrypt(&mut rng, padding, &session_key).context("RSA-OAEP encryption failed")?;
 
     let aead = Aes256Gcm::new_from_slice(&session_key).expect("32-byte key");
-    let aes_ct = aead
-        .encrypt(Nonce::from_slice(&[0u8; 12]), plaintext)
-        .map_err(|_| anyhow!("AES-GCM encryption failed"))?;
+    let aes_ct =
+        aead.encrypt(Nonce::from_slice(&[0u8; 12]), plaintext).map_err(|_| anyhow!("AES-GCM encryption failed"))?;
 
     let len = u16::try_from(rsa_ct.len()).context("RSA ciphertext too long")?;
     let mut out = Vec::with_capacity(2 + rsa_ct.len() + aes_ct.len());
@@ -316,7 +315,9 @@ pub(crate) mod tests {
             assert_eq!(doc["kind"], "SealedSecret");
             let enc = &doc["spec"]["encryptedData"];
             let label = scope.label("prod", "db");
-            let dec = |k: &str| hybrid_decrypt(&key, &core::b64_decode_bytes(enc[k].as_str().unwrap()).unwrap(), &label).unwrap();
+            let dec = |k: &str| {
+                hybrid_decrypt(&key, &core::b64_decode_bytes(enc[k].as_str().unwrap()).unwrap(), &label).unwrap()
+            };
             assert_eq!(dec("PASS"), b"hunter2");
             assert_eq!(dec("BIN"), b"\xff\xfe\x00");
             assert_eq!(dec("USER"), b"alice");
@@ -360,7 +361,8 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("key.pem");
         std::fs::write(&key_path, key.to_pkcs1_pem(Default::default()).unwrap().as_bytes()).unwrap();
-        let ct = core::b64_encode(hybrid_encrypt(&key.to_public_key(), b"from-rust \xf0\x9f\x94\x90", b"prod/db").unwrap());
+        let ct =
+            core::b64_encode(hybrid_encrypt(&key.to_public_key(), b"from-rust \xf0\x9f\x94\x90", b"prod/db").unwrap());
         let prog = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/interop/hybrid_decrypt.go");
         let out = std::process::Command::new("go")
             .args(["run", prog, key_path.to_str().unwrap(), "prod/db", &ct])

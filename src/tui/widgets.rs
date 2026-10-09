@@ -74,8 +74,11 @@ impl Input {
     /// Render text (optionally masked) scrolled so the cursor stays visible.
     /// Returns the line and the cursor column relative to `width`.
     pub fn view(&self, width: u16, masked: bool) -> (String, u16) {
-        let chars: Vec<char> =
-            if masked { std::iter::repeat_n(MASK, self.value.chars().count()).collect() } else { self.value.chars().map(visible).collect() };
+        let chars: Vec<char> = if masked {
+            std::iter::repeat_n(MASK, self.value.chars().count()).collect()
+        } else {
+            self.value.chars().map(visible).collect()
+        };
         let w = width.max(1) as usize;
         let start = self.cursor.saturating_sub(w.saturating_sub(1));
         let shown: String = chars.iter().skip(start).take(w).collect();

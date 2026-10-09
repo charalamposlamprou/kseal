@@ -72,11 +72,6 @@ pub fn b64_decode(s: &str) -> Result<String, DecodeError> {
     String::from_utf8(b64_decode_bytes(s)?).map_err(|_| DecodeError::NotUtf8)
 }
 
-/// Lossy variant for display: invalid UTF-8 becomes U+FFFD.
-pub fn b64_decode_lossy(s: &str) -> Result<String, base64::DecodeError> {
-    Ok(String::from_utf8_lossy(&b64_decode_bytes(s)?).into_owned())
-}
-
 /// Whether Kubernetes itself would accept `s` as a base64 `data` value.
 ///
 /// Stricter than [`b64_decode`]: Go's decoder ignores only `\r` and `\n` and
@@ -93,10 +88,7 @@ pub fn b64_valid_for_k8s(s: &str) -> bool {
 
 /// Python's `str.splitlines` boundaries, so a file parses identically.
 fn is_line_break(c: char) -> bool {
-    matches!(
-        c,
-        '\n' | '\r' | '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}'
-    )
+    matches!(c, '\n' | '\r' | '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}')
 }
 
 fn dotenv_unescape(val: &str) -> String {
@@ -177,12 +169,8 @@ pub fn dotenv_line(key: &str, val: &str) -> Result<String, UnrepresentableKey> {
     if BARE_ENV.is_match(val) {
         return Ok(format!("{key}={val}"));
     }
-    let esc = val
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t");
+    let esc =
+        val.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
     Ok(format!("{key}=\"{esc}\""))
 }
 
@@ -228,8 +216,8 @@ static SAFE_YAML: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\A[A-Za-z][A-Z
 /// Words a YAML 1.1 parser (kubectl) reads as booleans/null even when they
 /// are meant as strings — e.g. a key "NO" or a base64 value "True".
 const YAML_AMBIG: &[&str] = &[
-    "y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO", "true", "True", "TRUE", "false",
-    "False", "FALSE", "on", "On", "ON", "off", "Off", "OFF", "null", "Null", "NULL",
+    "y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO", "true", "True", "TRUE", "false", "False", "FALSE", "on",
+    "On", "ON", "off", "Off", "OFF", "null", "Null", "NULL",
 ];
 
 /// Return `v` as a YAML scalar, double-quoting (with escaping) unless it is a
@@ -520,6 +508,137 @@ pub fn secret_identity(doc: &Value) -> (String, String, String) {
 }
 
 // ---------------------------------------------------------------------------
+// Editor behaviour shared by the TUI (kept here so it is testable headless)
+// ---------------------------------------------------------------------------
+
+/// Fallback Secret identity when the fields are blank / nothing was loaded.
+pub const DEF_NAME: &str = "my-secret";
+pub const DEF_NS: &str = "default";
+
+/// What a user-picked file holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Env,
+    /// YAML with a Secret (or a SealedSecret, which callers reject with a hint).
+    SecretYaml,
+}
+
+/// Decide whether a picked file is a `.env` or a Secret manifest: the
+/// extension decides when it's conclusive, otherwise the content does (a
+/// `.env` never parses to a Secret-shaped YAML doc).
+pub fn detect_file_kind(path: &str, text: &str) -> FileKind {
+    let lower = path.to_lowercase();
+    let file = lower.rsplit(['/', '\\']).next().unwrap_or("");
+    if file.ends_with(".yaml") || file.ends_with(".yml") {
+        return FileKind::SecretYaml;
+    }
+    if file.ends_with(".env") || file.starts_with(".env") {
+        return FileKind::Env;
+    }
+    match parse_yaml_docs(text) {
+        Ok(docs) if select_secret_doc(&docs).is_some() || has_sealed_secret(&docs) => FileKind::SecretYaml,
+        _ => FileKind::Env,
+    }
+}
+
+/// Guards shared by Import and Load-from-cluster, run BEFORE the editor is
+/// touched so a rejected secret can't destroy in-progress rows. Returns an
+/// error message, or `None` if the entries are safe to apply.
+pub fn check_entries(entries: &[Entry]) -> Option<String> {
+    if entries.is_empty() {
+        return Some("Secret has no data/stringData — nothing to import".into());
+    }
+    // "invalid" means Kubernetes itself would reject the value at apply time.
+    // Two causes, two remedies: plaintext mistakenly under `data`, or binary
+    // base64 with broken padding.
+    first_invalid_key(entries).map(|bad| {
+        format!("data.{bad} is not valid base64 for Kubernetes — plaintext belongs under stringData; binary needs exact '=' padding")
+    })
+}
+
+/// Split entries into editable text pairs and binary passthrough pairs (key →
+/// ORIGINAL base64, re-emitted verbatim on Generate). Invalid entries never
+/// get here — callers run [`check_entries`] first — but are kept as binary
+/// rather than silently re-encoded if they do.
+pub fn split_entries(entries: &[Entry]) -> (Pairs, Pairs) {
+    let mut text = Pairs::new();
+    let mut binary = Pairs::new();
+    for e in entries {
+        let dest = if e.kind == EntryKind::Text { &mut text } else { &mut binary };
+        dest.push((e.key.clone(), e.value.clone()));
+    }
+    (text, binary)
+}
+
+/// Status line for a secret applied to the editor ("Loaded"/"Imported").
+pub fn applied_msg(verb: &str, total: usize, binary: usize, src: &str) -> String {
+    let mut msg = format!("{verb} {total} key(s) from {src}");
+    if binary > 0 {
+        msg.push_str(&format!(" — {binary} binary value(s) kept as-is"));
+    }
+    msg
+}
+
+/// The persistent warning shown while a loaded secret had malformed metadata.
+pub fn skip_warning(skipped: usize) -> Option<String> {
+    (skipped > 0).then(|| {
+        format!("⚠  {skipped} invalid metadata field(s) in the loaded secret — missing from generated / sealed YAML")
+    })
+}
+
+/// Qualify an output-derived success message (Generate/Save/Seal/Copy) with
+/// the pending skipped-metadata count. Returns `(message, is_warning)`.
+pub fn qualify_output(msg: &str, skipped: usize) -> (String, bool) {
+    if skipped > 0 {
+        (format!("{msg} — {skipped} invalid metadata field(s) skipped"), true)
+    } else {
+        (msg.into(), false)
+    }
+}
+
+/// Editable rows → the pairs Generate emits: keys trimmed, blank keys
+/// skipped, a duplicate key keeps its first position with the last value.
+pub fn collect_pairs<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str)>) -> Pairs {
+    let mut out = Pairs::new();
+    let mut index = HashMap::new();
+    for (k, v) in rows {
+        let k = k.trim();
+        if !k.is_empty() {
+            put_pair(&mut out, &mut index, k.to_string(), v.to_string());
+        }
+    }
+    out
+}
+
+/// Status line for a successful Generate.
+pub fn generated_msg(keys: usize, binary: usize, carried: bool) -> String {
+    let mut msg = format!("Generated YAML with {keys} key(s)");
+    if binary > 0 {
+        msg.push_str(&format!(" ({binary} binary kept as-is)"));
+    }
+    if carried {
+        msg.push_str(" — labels/annotations/immutable carried over");
+    }
+    msg
+}
+
+/// A value round-tripped through `$EDITOR`: editors append a final newline
+/// on save, so drop exactly one when the original had none. A value that
+/// already ended in a newline (PEM) keeps whatever the user saved.
+pub fn editor_result(original: &str, edited: String) -> String {
+    if original.ends_with('\n') {
+        return edited;
+    }
+    let mut edited = edited;
+    if edited.ends_with("\r\n") {
+        edited.truncate(edited.len() - 2);
+    } else if edited.ends_with('\n') {
+        edited.truncate(edited.len() - 1);
+    }
+    edited
+}
+
+// ---------------------------------------------------------------------------
 // Secret-bearing file output
 // ---------------------------------------------------------------------------
 
@@ -538,7 +657,7 @@ pub fn write_secret_file(path: &std::path::Path, content: &str) -> std::io::Resu
         let mut f = opts.open(path)?;
         f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         f.write_all(content.as_bytes())?;
-        return f.sync_all();
+        f.sync_all()
     }
     #[cfg(not(unix))]
     {
@@ -626,7 +745,17 @@ mod tests {
     }
     #[test]
     fn dotenv_line_round_trips() {
-        for v in ["simple", "with space", "has\"quote", "multi\nline", "tab\tchar", "trailing\\backslash", "", "a=b=c", "\\n literal"] {
+        for v in [
+            "simple",
+            "with space",
+            "has\"quote",
+            "multi\nline",
+            "tab\tchar",
+            "trailing\\backslash",
+            "",
+            "a=b=c",
+            "\\n literal",
+        ] {
             let line = dotenv_line("KEY", v).unwrap();
             assert_eq!(parse_dotenv(&line), p(&[("KEY", v)]), "{v:?}");
         }
@@ -687,7 +816,14 @@ mod tests {
     #[test]
     fn build_secret_yaml_raw_data_emitted_verbatim() {
         let already = b64_encode("\x00\x01binary");
-        let out = build_secret_yaml("s", "ns", &p(&[("FOO", "bar")]), "Opaque", &p(&[("CERT", &already)]), &Carryover::default());
+        let out = build_secret_yaml(
+            "s",
+            "ns",
+            &p(&[("FOO", "bar")]),
+            "Opaque",
+            &p(&[("CERT", &already)]),
+            &Carryover::default(),
+        );
         let doc = yaml1(&out);
         assert_eq!(doc["data"]["CERT"], already.as_str());
         assert_eq!(b64_decode(doc["data"]["FOO"].as_str().unwrap()).unwrap(), "bar");
@@ -740,9 +876,15 @@ mod tests {
     }
     #[test]
     fn secret_entries_stringdata() {
-        assert_eq!(secret_entries(&json!({"stringData": {"USER": "alice"}})), vec![e("USER", "alice", EntryKind::Text)]);
+        assert_eq!(
+            secret_entries(&json!({"stringData": {"USER": "alice"}})),
+            vec![e("USER", "alice", EntryKind::Text)]
+        );
         let doc = json!({"data": {"A": b64_encode("from-data"), "B": b64_encode("b")}, "stringData": {"A": "from-stringdata"}});
-        assert_eq!(secret_entries(&doc), vec![e("A", "from-stringdata", EntryKind::Text), e("B", "b", EntryKind::Text)]);
+        assert_eq!(
+            secret_entries(&doc),
+            vec![e("A", "from-stringdata", EntryKind::Text), e("B", "b", EntryKind::Text)]
+        );
     }
     #[test]
     fn secret_entries_non_secret_returns_empty() {
@@ -793,7 +935,8 @@ mod tests {
     #[test]
     fn select_unwraps_lists_nested_and_deep() {
         let secret = json!({"kind": "Secret", "metadata": {"name": "from-list"}, "data": {"t": "dg=="}});
-        let wrapper = json!({"apiVersion": "v1", "kind": "List", "items": [{"kind": "ConfigMap", "data": {"K": "v"}}, secret]});
+        let wrapper =
+            json!({"apiVersion": "v1", "kind": "List", "items": [{"kind": "ConfigMap", "data": {"K": "v"}}, secret]});
         assert_eq!(select_secret_doc(std::slice::from_ref(&wrapper)), Some(&wrapper["items"][1]));
         assert_eq!(select_secret_doc(&[json!({"kind": "List", "items": [null, "junk", 42]})]), None);
         // 5000 levels: the flattening itself is iterative, but serde_json
@@ -842,7 +985,7 @@ mod tests {
     }
     #[test]
     fn carryover_immutable_only_true() {
-        assert_eq!(secret_carryover(&json!({"immutable": true})).0.immutable, true);
+        assert!(secret_carryover(&json!({"immutable": true})).0.immutable);
         assert_eq!(secret_carryover(&json!({"immutable": false})), (Carryover::default(), 0));
         assert_eq!(secret_carryover(&json!({"immutable": "true"})), (Carryover::default(), 1));
     }
@@ -883,5 +1026,62 @@ mod tests {
         write_secret_file(&path, "password: café\n").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), "password: café\n".as_bytes());
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn detect_file_kind_by_extension_then_content() {
+        assert_eq!(detect_file_kind("/x/prod.env", "apiVersion: v1"), FileKind::Env);
+        assert_eq!(detect_file_kind("/x/.env.local", ""), FileKind::Env);
+        assert_eq!(detect_file_kind("C:\\x\\s.YAML", "A=b"), FileKind::SecretYaml);
+        let yaml = "apiVersion: v1\nkind: Secret\ndata:\n  A: YQ==\n";
+        assert_eq!(detect_file_kind("/x/secret", yaml), FileKind::SecretYaml);
+        assert_eq!(detect_file_kind("/x/sealed", "kind: SealedSecret\nspec: {}\n"), FileKind::SecretYaml);
+        assert_eq!(detect_file_kind("/x/vars", "A=b\nB=c\n"), FileKind::Env);
+        assert_eq!(detect_file_kind("/x/vars", "A: b\n"), FileKind::Env);
+        assert_eq!(detect_file_kind("/x/vars", "{{{ not yaml"), FileKind::Env);
+    }
+
+    #[test]
+    fn check_and_split_entries() {
+        assert!(check_entries(&[]).unwrap().contains("nothing to import"));
+        let doc = yaml1("kind: Secret\ndata:\n  T: aGk=\n  B: /w==\n  BAD: hunter2\n");
+        let entries = secret_entries(&doc);
+        assert!(check_entries(&entries).unwrap().starts_with("data.BAD is not valid base64"));
+        let ok = &entries[..2];
+        assert_eq!(check_entries(ok), None);
+        assert_eq!(split_entries(ok), (p(&[("T", "hi")]), p(&[("B", "/w==")])));
+    }
+
+    #[test]
+    fn status_messages() {
+        assert_eq!(applied_msg("Loaded", 3, 0, "db"), "Loaded 3 key(s) from db");
+        assert_eq!(
+            applied_msg("Imported", 3, 1, "s.yaml"),
+            "Imported 3 key(s) from s.yaml — 1 binary value(s) kept as-is"
+        );
+        assert_eq!(skip_warning(0), None);
+        assert!(skip_warning(2).unwrap().contains("2 invalid metadata field(s)"));
+        assert_eq!(qualify_output("Saved x", 0), ("Saved x".into(), false));
+        assert_eq!(qualify_output("Saved x", 1), ("Saved x — 1 invalid metadata field(s) skipped".into(), true));
+        assert_eq!(generated_msg(2, 0, false), "Generated YAML with 2 key(s)");
+        assert_eq!(
+            generated_msg(3, 1, true),
+            "Generated YAML with 3 key(s) (1 binary kept as-is) — labels/annotations/immutable carried over"
+        );
+    }
+
+    #[test]
+    fn collect_pairs_trims_skips_blank_and_last_dup_wins_in_place() {
+        let rows = [(" A ", "1"), ("", "x"), ("  ", "y"), ("B", "2"), ("A", "3")];
+        assert_eq!(collect_pairs(rows), p(&[("A", "3"), ("B", "2")]));
+    }
+
+    #[test]
+    fn editor_result_drops_only_the_editor_added_newline() {
+        assert_eq!(editor_result("abc", "abcd\n".into()), "abcd");
+        assert_eq!(editor_result("abc", "abcd\r\n".into()), "abcd");
+        assert_eq!(editor_result("abc", "two\n\n".into()), "two\n");
+        assert_eq!(editor_result("abc", "none".into()), "none");
+        assert_eq!(editor_result("-----PEM-----\n", "-----PEM-----\n".into()), "-----PEM-----\n");
     }
 }
