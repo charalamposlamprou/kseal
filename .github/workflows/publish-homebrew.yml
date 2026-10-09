@@ -45,7 +45,8 @@ jobs:
             version=$(echo "$release" | jq --raw-output .app_version)
             cp "$ARTIFACTS/$filename" "Formula/$filename"
             # Don't reformat user-provided data such as the description.
-            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/$filename" || true
+            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/$filename" ||
+              echo "::warning file=Formula/$filename::brew style reported issues it couldn't fix"
             git add "Formula/$filename"
             git commit -m "Formula: ${filename%.rb} ${version} [skip ci]" || echo "formula unchanged"
           done

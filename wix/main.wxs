@@ -69,7 +69,7 @@
 
         <Package Id='*'
             Keywords='Installer'
-            Description='Terminal UI + CLI for Kubernetes Secrets: base64 encode/decode, .env → Secret YAML, and native SealedSecret sealing — read-only against the cluster.'
+            Description='TUI and CLI for Kubernetes Secrets, with native SealedSecret sealing'
             Manufacturer='Charalampos Lamprou'
             InstallerVersion='450'
             Languages='1033'

@@ -1,5 +1,5 @@
 class Kseal < Formula
-  desc "Terminal UI + CLI for Kubernetes Secrets: base64 encode/decode, .env → Secret YAML, and native SealedSecret sealing — read-only against the cluster."
+  desc "TUI and CLI for Kubernetes Secrets, with native SealedSecret sealing"
   homepage "https://github.com/charalamposlamprou/kseal"
   version "0.1.0"
   if OS.mac?
