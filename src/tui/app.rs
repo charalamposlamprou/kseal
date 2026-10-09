@@ -96,6 +96,18 @@ impl Focus {
             Tab::Seal => &[SealCtx, Scope, CtlName, CtlNs, Cert, Sealed],
         }
     }
+    /// The tab's fields as laid out on screen, row by row: what the arrow
+    /// keys move through. Flattened, it is the Tab order.
+    pub fn grid(tab: Tab) -> &'static [&'static [Focus]] {
+        use Focus::*;
+        match tab {
+            Tab::Encode => {
+                &[&[SvIn], &[SvOut], &[EncCtx, EncNs, EncSecret], &[Rows], &[SecName, SecNs, SecType], &[Yaml]]
+            }
+            Tab::Decode => &[&[DvIn], &[DvOut], &[DecRows]],
+            Tab::Seal => &[&[SealCtx, Scope], &[CtlName, CtlNs], &[Cert], &[Sealed]],
+        }
+    }
     /// Fields that take typed text (so `?` and letters are input, not keys).
     pub fn is_text(self) -> bool {
         use Focus::*;
@@ -353,7 +365,7 @@ pub struct View {
     pub sealed_h: u16,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Scroll {
     pub y: u16,
     pub x: u16,
@@ -362,6 +374,9 @@ pub struct Scroll {
 pub struct App {
     pub tab: Tab,
     focus: [Focus; 3],
+    /// Per tab, the column ↑/↓ aim for, so moving down through a one-field
+    /// row and back up returns to where you came from.
+    want_col: [usize; 3],
     pub modal: Option<Modal>,
     pub status: Status,
     pub quit: bool,
@@ -435,6 +450,7 @@ impl App {
         Self {
             tab: Tab::Encode,
             focus: [Focus::SvIn, Focus::DvIn, Focus::SealCtx],
+            want_col: [0; 3],
             modal: None,
             status: Status::ready(),
             quit: false,
@@ -497,6 +513,33 @@ impl App {
 
     fn set_focus(&mut self, f: Focus) {
         self.focus[self.tab.idx()] = f;
+        self.want_col[self.tab.idx()] = self.grid_pos().1;
+    }
+
+    /// (row, column) of the focused field in [`Focus::grid`].
+    fn grid_pos(&self) -> (usize, usize) {
+        let f = self.focus();
+        Focus::grid(self.tab)
+            .iter()
+            .enumerate()
+            .find_map(|(r, row)| row.iter().position(|x| *x == f).map(|c| (r, c)))
+            .unwrap_or((0, 0))
+    }
+
+    /// Move focus one row up/down (aiming for `want_col`) or one field
+    /// left/right along the row. Returns false at the edge of the layout.
+    fn move_focus(&mut self, dr: isize, dc: isize) -> bool {
+        let grid = Focus::grid(self.tab);
+        let (r, c) = self.grid_pos();
+        if dr != 0 {
+            let Some(row) = r.checked_add_signed(dr).and_then(|nr| grid.get(nr)) else { return false };
+            let col = self.want_col[self.tab.idx()].min(row.len() - 1);
+            self.focus[self.tab.idx()] = row[col];
+        } else {
+            let Some(&f) = c.checked_add_signed(dc).and_then(|nc| grid[r].get(nc)) else { return false };
+            self.set_focus(f);
+        }
+        true
     }
 
     // ------------------------------------------------------------ status
@@ -704,6 +747,7 @@ impl App {
             KeyCode::F(n @ 1..=3) => self.tab = Tab::ALL[n as usize - 1],
             KeyCode::Tab => self.cycle_focus(1),
             KeyCode::BackTab => self.cycle_focus(-1),
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right if !ctrl => self.arrow(k),
             KeyCode::Char(c) if ctrl => match c {
                 'n' => self.tab = Tab::ALL[(self.tab.idx() + 1) % 3],
                 'p' => self.tab = Tab::ALL[(self.tab.idx() + 2) % 3],
@@ -730,6 +774,48 @@ impl App {
         let i = order.iter().position(|f| *f == self.focus()).unwrap_or(0) as isize;
         let n = order.len() as isize;
         self.set_focus(order[((i + d).rem_euclid(n)) as usize]);
+    }
+
+    /// Arrows act inside the focused field first (table rows, pane scroll,
+    /// text cursor) and move to the neighbouring field at its edge.
+    fn arrow(&mut self, k: KeyEvent) {
+        let f = self.focus();
+        let vertical = matches!(k.code, KeyCode::Up | KeyCode::Down);
+        let d: isize = if matches!(k.code, KeyCode::Up | KeyCode::Left) { -1 } else { 1 };
+        let moved_inside = match f {
+            Focus::Rows if vertical => list_nav(&mut self.rows_state, k, self.rows.len(), self.view.rows_h),
+            Focus::DecRows if vertical => list_nav(&mut self.dec_state, k, self.dec_rows.len(), self.view.dec_h),
+            Focus::Yaml => scroll_key(&mut self.yaml_scroll, k, self.view.yaml_h, &self.yaml_out),
+            Focus::Sealed => scroll_key(&mut self.sealed_scroll, k, self.view.sealed_h, &self.sealed_out),
+            _ if f.is_text() && !vertical => {
+                let input = self.text_input(f);
+                let at_edge = if d < 0 { input.at_start() } else { input.at_end() };
+                if !at_edge {
+                    input.handle(k);
+                }
+                !at_edge
+            }
+            _ => false,
+        };
+        if !moved_inside {
+            if vertical {
+                self.move_focus(d, 0)
+            } else {
+                self.move_focus(0, d)
+            };
+        }
+    }
+
+    fn text_input(&mut self, f: Focus) -> &mut Input {
+        match f {
+            Focus::SvIn => &mut self.sv_in,
+            Focus::DvIn => &mut self.dv_in,
+            Focus::SecName => &mut self.sec_name,
+            Focus::SecNs => &mut self.sec_ns,
+            Focus::CtlName => &mut self.ctl_name,
+            Focus::CtlNs => &mut self.ctl_ns,
+            _ => &mut self.cert,
+        }
     }
 
     fn field_key(&mut self, k: KeyEvent) {
@@ -761,20 +847,18 @@ impl App {
                 }
             }
             Focus::EncCtx | Focus::EncNs | Focus::EncSecret | Focus::SecType | Focus::SealCtx | Focus::Scope => {
-                match k.code {
-                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Down => self.open_picker(f),
-                    KeyCode::Left | KeyCode::Right if f == Focus::Scope => {
-                        let i = Scope::ALL.iter().position(|s| *s == self.scope).unwrap_or(0);
-                        let d = if k.code == KeyCode::Right { 1 } else { 2 };
-                        self.scope = Scope::ALL[(i + d) % 3];
-                    }
-                    _ => {}
+                if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    self.open_picker(f);
                 }
             }
             Focus::Rows => self.rows_key(k),
             Focus::DecRows => self.dec_key(k),
-            Focus::Yaml => scroll_key(&mut self.yaml_scroll, k, self.view.yaml_h, &self.yaml_out),
-            Focus::Sealed => scroll_key(&mut self.sealed_scroll, k, self.view.sealed_h, &self.sealed_out),
+            Focus::Yaml => {
+                scroll_key(&mut self.yaml_scroll, k, self.view.yaml_h, &self.yaml_out);
+            }
+            Focus::Sealed => {
+                scroll_key(&mut self.sealed_scroll, k, self.view.sealed_h, &self.sealed_out);
+            }
             Focus::SvOut | Focus::DvOut => {}
         }
     }
@@ -840,7 +924,9 @@ impl App {
                 }
             }
             KeyCode::Char('V') => self.rows_show_all(),
-            _ => list_nav(&mut self.rows_state, k, n, self.view.rows_h),
+            _ => {
+                list_nav(&mut self.rows_state, k, n, self.view.rows_h);
+            }
         }
     }
 
@@ -862,7 +948,9 @@ impl App {
                 }
             }
             KeyCode::Char('V') => self.dec_show_all(),
-            _ => list_nav(&mut self.dec_state, k, self.dec_rows.len(), self.view.dec_h),
+            _ => {
+                list_nav(&mut self.dec_state, k, self.dec_rows.len(), self.view.dec_h);
+            }
         }
     }
 
@@ -1698,10 +1786,11 @@ fn last_line(s: &str) -> String {
     s.trim().lines().last().unwrap_or("").chars().take(120).collect()
 }
 
-fn list_nav(state: &mut TableState, k: KeyEvent, n: usize, page: u16) {
+/// Move the table selection. Returns whether it moved.
+fn list_nav(state: &mut TableState, k: KeyEvent, n: usize, page: u16) -> bool {
     if n == 0 {
         state.select(None);
-        return;
+        return false;
     }
     let cur = state.selected().unwrap_or(0);
     let page = (page as usize).max(1);
@@ -1712,12 +1801,15 @@ fn list_nav(state: &mut TableState, k: KeyEvent, n: usize, page: u16) {
         KeyCode::PageDown => cur + page,
         KeyCode::Home | KeyCode::Char('g') => 0,
         KeyCode::End | KeyCode::Char('G') => n - 1,
-        _ => return,
+        _ => return false,
     };
     state.select(Some(next.min(n - 1)));
+    state.selected() != Some(cur)
 }
 
-fn scroll_key(s: &mut Scroll, k: KeyEvent, page: u16, text: &str) {
+/// Scroll a pane. Returns whether it moved.
+fn scroll_key(s: &mut Scroll, k: KeyEvent, page: u16, text: &str) -> bool {
+    let before = *s;
     let lines = text.lines().count() as u16;
     let max_y = lines.saturating_sub(page.max(1));
     let page = page.max(1);
@@ -1732,6 +1824,7 @@ fn scroll_key(s: &mut Scroll, k: KeyEvent, page: u16, text: &str) {
         KeyCode::Right | KeyCode::Char('l') => s.x = s.x.saturating_add(4),
         _ => {}
     }
+    *s != before
 }
 
 #[cfg(test)]
@@ -2069,5 +2162,80 @@ mod tests {
         assert_eq!(app.tab, Tab::Encode);
         app.on_key(ctrl('q'));
         assert!(app.quit);
+    }
+
+    fn press(app: &mut App, codes: &[KeyCode]) {
+        for c in codes {
+            app.on_key(key(*c));
+        }
+    }
+
+    #[test]
+    fn grid_flattens_to_the_tab_order() {
+        for tab in Tab::ALL {
+            let flat: Vec<Focus> = Focus::grid(tab).iter().flat_map(|r| r.iter().copied()).collect();
+            assert_eq!(flat, Focus::order(tab), "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn arrows_move_through_the_layout_and_remember_the_column() {
+        use KeyCode::{Down, Left, Right, Up};
+        let mut app = App::new();
+        press(&mut app, &[Down, Down]);
+        assert_eq!(app.focus(), Focus::EncCtx);
+        press(&mut app, &[Right, Right, Right]); // stops at the row's end
+        assert_eq!(app.focus(), Focus::EncSecret);
+        press(&mut app, &[Left]);
+        assert_eq!(app.focus(), Focus::EncNs);
+        press(&mut app, &[Right]);
+        press(&mut app, &[Down]); // empty table: straight through it
+        assert_eq!(app.focus(), Focus::Rows);
+        press(&mut app, &[Down]);
+        assert_eq!(app.focus(), Focus::SecType, "keeps the Secret column");
+        press(&mut app, &[Up, Up]);
+        assert_eq!(app.focus(), Focus::EncSecret);
+        press(&mut app, &[Up, Up, Up, Up]); // stops at the top
+        assert_eq!(app.focus(), Focus::SvIn);
+        // Pickers open with Enter, not arrows.
+        press(&mut app, &[Down, Down, Down]);
+        assert!(app.modal.is_none());
+
+        app.on_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        press(&mut app, &[Right]);
+        assert_eq!((app.focus(), app.scope), (Focus::Scope, Scope::Strict), "arrows move, they don't cycle scope");
+        press(&mut app, &[Down, Down]);
+        assert_eq!(app.focus(), Focus::Cert);
+    }
+
+    #[test]
+    fn arrows_act_inside_tables_and_text_before_leaving() {
+        use KeyCode::{Down, End, Home, Left, Right, Up};
+        let mut app = App::new();
+        open_file(&mut app, "a.env", "A=1\nB=2\n");
+        app.set_focus(Focus::Rows);
+        app.rows_state.select(Some(0));
+        press(&mut app, &[Down]);
+        assert_eq!((app.focus(), app.rows_state.selected()), (Focus::Rows, Some(1)));
+        press(&mut app, &[Down]); // last row: on to the next field
+        assert_eq!(app.focus(), Focus::SecName);
+        press(&mut app, &[Up, Up]);
+        assert_eq!((app.focus(), app.rows_state.selected()), (Focus::Rows, Some(0)));
+        press(&mut app, &[Up]);
+        assert_eq!(app.focus(), Focus::EncCtx);
+
+        // Text: ←/→ move the cursor, and only leave the field at its ends.
+        app.set_focus(Focus::SecNs); // "default", cursor at the end
+        press(&mut app, &[Left]);
+        assert_eq!(app.focus(), Focus::SecNs);
+        press(&mut app, &[Right, Right]);
+        assert_eq!(app.focus(), Focus::SecType);
+        press(&mut app, &[Left]);
+        assert_eq!(app.focus(), Focus::SecNs);
+        press(&mut app, &[Home, Left]);
+        assert_eq!(app.focus(), Focus::SecName);
+        press(&mut app, &[End, Right]);
+        assert_eq!(app.focus(), Focus::SecNs);
+        assert_eq!((app.sec_name.value(), app.sec_ns.value()), ("my-secret", "default"), "arrows never edit");
     }
 }

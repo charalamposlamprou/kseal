@@ -70,7 +70,8 @@ on every tab. Saved files are written owner-only (`0600`).
 
 | Key | Action |
 |---|---|
-| `Tab` / `Shift-Tab` | Move focus |
+| `↑` `↓` `←` `→` | Move between fields, following the layout. Inside a table, a YAML pane or a text box they move or scroll there first, and continue to the neighbouring field at the edge |
+| `Tab` / `Shift-Tab` | Next / previous field |
 | `F1` `F2` `F3` / `Ctrl+N` `Ctrl+P` | Switch tabs |
 | `Ctrl+G` | Generate Secret YAML |
 | `Ctrl+O` | Open a file: `.env` or Secret YAML, detected automatically (Seal tab: certificate) |
@@ -86,7 +87,7 @@ on every tab. Saved files are written owner-only (`0600`).
 
 In a key table: `a` add, `d` delete, `Enter` edit, `e` edit the value in
 `$EDITOR` (for multi-line values such as PEM keys or JSON), `v` / `V` show one
-or all. Pickers filter as you type.
+or all. Pickers open with `Enter` and filter as you type.
 
 Over SSH, copying uses OSC 52, so the text lands in your *local* clipboard
 (your terminal must allow OSC 52; in tmux, enable `set-clipboard`).
