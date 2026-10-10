@@ -11,11 +11,7 @@ binary. kseal ships as one static binary with a TUI and scriptable subcommands.
 > mutating `kube::Api` methods are banned in `clippy.toml`, so CI fails if one
 > sneaks in.
 
-<!-- Screenshots: replace with real captures of each tab.
-![Encode tab](docs/encode.png)
-![Decode tab](docs/decode.png)
-![Seal tab](docs/seal.png)
--->
+![kseal TUI: the Encode tab](docs/encode.png)
 
 ## Install
 
