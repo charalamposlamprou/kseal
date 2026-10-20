@@ -622,10 +622,28 @@ pub fn generated_msg(keys: usize, binary: usize, carried: bool) -> String {
     msg
 }
 
+/// Whether every line break in `s` is CRLF (and there is at least one) —
+/// typical of a PEM created on Windows.
+fn is_crlf(s: &str) -> bool {
+    s.contains("\r\n") && s.matches('\n').count() == s.matches("\r\n").count()
+}
+
+/// The text handed to `$EDITOR`: a value with CRLF line breaks is shown with
+/// LF so the editor doesn't render a `^M` on every line (and copying from it
+/// doesn't carry the CRs). [`editor_result`] restores the CRLFs on save.
+pub fn editor_text(value: &str) -> String {
+    if is_crlf(value) { value.replace("\r\n", "\n") } else { value.to_string() }
+}
+
 /// A value round-tripped through `$EDITOR`: editors append a final newline
 /// on save, so drop exactly one when the original had none. A value that
-/// already ended in a newline (PEM) keeps whatever the user saved.
+/// already ended in a newline (PEM) keeps whatever the user saved. A CRLF
+/// original (see [`editor_text`]) gets its CRLF line breaks back.
 pub fn editor_result(original: &str, edited: String) -> String {
+    if is_crlf(original) {
+        let lf = editor_result(&editor_text(original), edited.replace("\r\n", "\n"));
+        return lf.replace('\n', "\r\n");
+    }
     if original.ends_with('\n') {
         return edited;
     }
@@ -1083,5 +1101,23 @@ mod tests {
         assert_eq!(editor_result("abc", "two\n\n".into()), "two\n");
         assert_eq!(editor_result("abc", "none".into()), "none");
         assert_eq!(editor_result("-----PEM-----\n", "-----PEM-----\n".into()), "-----PEM-----\n");
+    }
+
+    #[test]
+    fn editor_shows_crlf_values_as_lf_and_restores_crlf() {
+        let pem = "-----BEGIN KEY-----\r\nabc\r\n-----END KEY-----\r\n";
+        let shown = editor_text(pem);
+        assert_eq!(shown, "-----BEGIN KEY-----\nabc\n-----END KEY-----\n");
+        // Saved unchanged: the original bytes come back.
+        assert_eq!(editor_result(pem, shown.clone()), pem);
+        // Edited, or saved by an editor that kept CRLF: still CRLF.
+        assert_eq!(editor_result(pem, shown.replace("abc", "xyz")), pem.replace("abc", "xyz"));
+        assert_eq!(editor_result(pem, pem.into()), pem);
+        // No trailing newline: the editor-added one is still dropped.
+        assert_eq!(editor_result("a\r\nb", "a\nb\n".into()), "a\r\nb");
+        // Mixed or LF-only line breaks are left as they are.
+        assert_eq!(editor_text("a\r\nb\nc"), "a\r\nb\nc");
+        assert_eq!(editor_text("a\nb\n"), "a\nb\n");
+        assert_eq!(editor_text("a\rb"), "a\rb");
     }
 }

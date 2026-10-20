@@ -268,7 +268,7 @@ fn edit_external(term: &mut Term, value: &str) -> Result<Result<String>> {
         Err(e) => return Ok(Err(e)),
     };
     let path = dir.join("value.txt");
-    let res = match core::write_secret_file(&path, value) {
+    let res = match core::write_secret_file(&path, &core::editor_text(value)) {
         Err(e) => Err(anyhow::Error::from(e).context("writing the temp file")),
         Ok(()) => {
             let mut cmd = editor_command(&path);
