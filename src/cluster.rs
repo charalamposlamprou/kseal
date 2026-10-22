@@ -55,11 +55,12 @@ pub async fn client_for(context: Option<&str>, interactive: bool) -> Result<(Cli
 /// Prefix of every [`describe_error`] message for a failed cluster login.
 pub const LOGIN_FAILED: &str = "Cluster login failed";
 
-/// An error from a cluster call, made readable. A failed exec credential
-/// plugin is reported by its own error output: kube's message is the whole
-/// command line with its environment plus the raw output, which buries the
-/// cause (e.g. an expired AWS token) past the edge of the screen.
-pub fn describe_error(e: &anyhow::Error) -> String {
+/// An error from a cluster call on `context` (`None`: the current one),
+/// made readable. A failed exec credential plugin is reported by its own
+/// error output: kube's message is the whole command line with its
+/// environment plus the raw output, which buries the cause (e.g. an expired
+/// AWS token) past the edge of the screen.
+pub fn describe_error(e: &anyhow::Error, context: Option<&str>) -> String {
     let auth = e.chain().find_map(|c| c.downcast_ref::<AuthError>());
     match auth {
         Some(AuthError::AuthExecRun { status, out, .. }) => {
@@ -71,10 +72,26 @@ pub fn describe_error(e: &anyhow::Error) -> String {
             }
         }
         Some(AuthError::AuthExecStart(io)) => {
-            format!("{LOGIN_FAILED}: could not run the kubeconfig's credential plugin: {io}")
+            // kube's error doesn't say which command; the kubeconfig does.
+            let what = match exec_command(context) {
+                Some(cmd) => format!("`{cmd}`, the kubeconfig's credential plugin"),
+                None => "the kubeconfig's credential plugin".into(),
+            };
+            let hint = if io.kind() == std::io::ErrorKind::NotFound { " — is it installed and on PATH?" } else { "" };
+            format!("{LOGIN_FAILED}: could not run {what}: {io}{hint}")
         }
         _ => format!("{e:#}"),
     }
+}
+
+/// The exec credential plugin command `context` (`None`: the current one)
+/// logs in with, if any.
+fn exec_command(context: Option<&str>) -> Option<String> {
+    let kc = Kubeconfig::read().ok()?;
+    let name = context.map(str::to_owned).or(kc.current_context)?;
+    let user = kc.contexts.iter().find(|c| c.name == name)?.context.as_ref()?.user.clone()?;
+    let auth = kc.auth_infos.iter().find(|a| a.name == user)?.auth_info.as_ref()?;
+    auth.exec.as_ref()?.command.clone()
 }
 
 pub async fn list_namespaces(client: &Client) -> Result<Vec<String>> {
@@ -206,7 +223,7 @@ mod tests {
             status: out.status,
             out,
         });
-        let msg = describe_error(&anyhow::Error::from(err).context("listing namespaces"));
+        let msg = describe_error(&anyhow::Error::from(err).context("listing namespaces"), None);
         assert_eq!(
             msg,
             "Cluster login failed: the kubeconfig's credential plugin failed (exit status: 255):\n\
@@ -220,10 +237,15 @@ mod tests {
             stderr: vec![],
         };
         let err = kube::Error::Auth(AuthError::AuthExecRun { cmd: String::new(), status: out.status, out });
-        let msg = describe_error(&anyhow::Error::from(err));
+        let msg = describe_error(&anyhow::Error::from(err), None);
         assert_eq!(msg, "Cluster login failed: the kubeconfig's credential plugin failed (exit status: 1)");
+        // A plugin that couldn't start: missing from PATH gets a hint.
+        let err = kube::Error::Auth(AuthError::AuthExecStart(std::io::ErrorKind::NotFound.into()));
+        let msg = describe_error(&anyhow::Error::from(err), Some("no-such-context"));
+        assert!(msg.starts_with("Cluster login failed: could not run the kubeconfig's credential plugin"), "{msg}");
+        assert!(msg.ends_with("— is it installed and on PATH?"), "{msg}");
         // Anything else keeps the full chain.
-        assert_eq!(describe_error(&anyhow!("boom").context("listing namespaces")), "listing namespaces: boom");
+        assert_eq!(describe_error(&anyhow!("boom").context("listing namespaces"), None), "listing namespaces: boom");
     }
 
     #[test]

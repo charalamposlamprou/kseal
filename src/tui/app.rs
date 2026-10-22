@@ -199,33 +199,12 @@ pub enum ReadPurpose {
 
 #[derive(Debug)]
 pub enum Modal {
-    Picker {
-        target: PickTarget,
-        picker: Picker,
-    },
-    Path {
-        purpose: PathPurpose,
-        input: Input,
-    },
-    RowEdit {
-        idx: Option<usize>,
-        key: Input,
-        value: Input,
-        on_value: bool,
-        shown: bool,
-    },
-    Overwrite {
-        path: String,
-        content: String,
-        what: SaveWhat,
-        skipped: usize,
-    },
+    Picker { target: PickTarget, picker: Picker },
+    Path { purpose: PathPurpose, input: Input },
+    RowEdit { idx: Option<usize>, key: Input, value: Input, on_value: bool, shown: bool },
+    Overwrite { path: String, content: String, what: SaveWhat, skipped: usize },
     Help,
-    /// A failed operation, in full (the status line only fits one line).
-    Error {
-        title: String,
-        detail: String,
-    },
+    Error { title: String, detail: String },
 }
 
 /// Side effects for the event loop to run. Results come back as [`Msg`]s.

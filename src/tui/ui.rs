@@ -622,8 +622,10 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
             None
         }
         Modal::Error { title, detail } => {
-            // The summary in bold, then the cause (e.g. the plugin's own output).
-            let mut lines: Vec<Line> = detail.lines().map(Line::raw).collect();
+            // The summary in bold, then the cause (e.g. the plugin's own
+            // output). Control characters are made visible: raw, an escape
+            // sequence in a plugin's stderr would reach the terminal.
+            let mut lines: Vec<Line> = detail.lines().map(|l| Line::raw(one_line(l))).collect();
             if let Some(first) = lines.first_mut() {
                 *first = first.clone().bold();
             }
@@ -738,6 +740,10 @@ mod tests {
         let s = render(&mut app, 120, 40);
         assert!(s.contains("Controller detection failed") && s.contains("The security token included in the request"));
         assert!(s.contains("Ctrl+R to retry") && s.contains("Ctrl+Y copy the error"));
+        // Control characters never reach the terminal raw.
+        app.modal = Some(Modal::Error { title: "Load failed".into(), detail: "\x1b[31mred\x07".into() });
+        let s = render(&mut app, 120, 40);
+        assert!(s.contains("�[31mred�") && !s.contains('\x1b'));
     }
 
     #[test]

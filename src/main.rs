@@ -289,8 +289,15 @@ fn main() -> Result<()> {
     match cli.cmd {
         None => tui::run(rt),
         Some(cmd) => {
+            let context = match &cmd {
+                Cmd::Get { kube, .. }
+                | Cmd::Seal { kube, .. }
+                | Cmd::Validate { kube, .. }
+                | Cmd::Cert { kube, .. } => kube.context.clone(),
+                _ => None,
+            };
             if let Err(e) = rt.block_on(run(cmd)) {
-                eprintln!("error: {}", cluster::describe_error(&e));
+                eprintln!("error: {}", cluster::describe_error(&e, context.as_deref()));
                 std::process::exit(1);
             }
             Ok(())
