@@ -221,7 +221,7 @@ pub enum Modal {
         skipped: usize,
     },
     Help,
-    /// A failed cluster call, in full (the status line only fits one line).
+    /// A failed operation, in full (the status line only fits one line).
     Error {
         title: String,
         detail: String,
@@ -570,9 +570,10 @@ impl App {
         self.status_for(msg, kind, STATUS_DURATION);
     }
 
-    /// A cluster call failed: the last line of the error (the cause) goes to
-    /// the status line and the whole of it to a popup, unless another dialog
-    /// is open (it isn't interrupted; the first error popup stays).
+    /// An operation failed (cluster, file, editor, seal…): the last line of
+    /// the error (the cause) goes to the status line and the whole of it to a
+    /// popup, unless another dialog is open (it isn't interrupted; the first
+    /// error popup stays). Hints like "Generate YAML first" stay status-only.
     fn report_error(&mut self, title: &str, detail: String) {
         self.set_status(format!("{title}: {}", last_line(&detail)), Kind::Err);
         if self.modal.is_none() {
@@ -1341,7 +1342,7 @@ impl App {
             Focus::DvIn | Focus::DvOut => match self.dv_decoded() {
                 Ok(s) => (s, false),
                 Err(e) => {
-                    self.set_status(format!("Decode error: {e}"), Kind::Err);
+                    self.report_error("Decode failed", e.to_string());
                     return;
                 }
             },
@@ -1552,7 +1553,7 @@ impl App {
                 Err(WriteError::Exists(content)) => {
                     self.modal = Some(Modal::Overwrite { path, content, what, skipped });
                 }
-                Err(WriteError::Io(e)) => self.set_status(format!("Save failed: {e}"), Kind::Err),
+                Err(WriteError::Io(e)) => self.report_error("Save failed", e),
             },
             Msg::Sealed { out_gen, res } => {
                 self.sealing = false;
@@ -1574,7 +1575,7 @@ impl App {
                         if self.sealed_ok {
                             self.status_output("Sealed successfully", None);
                         } else {
-                            self.set_status("Sealing produced no output", Kind::Err);
+                            self.report_error("Seal failed", "Sealing produced no output".into());
                         }
                     }
                 }
@@ -1586,9 +1587,11 @@ impl App {
                 }
                 match res {
                     Ok(true) => self.set_status("Valid — the controller can decrypt this", Kind::Ok),
-                    Ok(false) => self.set_status(
-                        "Invalid seal — the controller cannot decrypt this (wrong key, scope, name or namespace)",
-                        Kind::Err,
+                    Ok(false) => self.report_error(
+                        "Invalid seal",
+                        "The controller cannot decrypt this SealedSecret.\n\
+                         Check that it was sealed with this controller's key, and its scope, name and namespace."
+                            .into(),
                     ),
                     Err(e) => self.report_error("Validation failed", e),
                 }
@@ -1604,7 +1607,7 @@ impl App {
                 let edited = match res {
                     Ok(s) => core::editor_result(&original, s),
                     Err(e) => {
-                        self.set_status(format!("Editor: {e}"), Kind::Err);
+                        self.report_error("Editor failed", e);
                         return;
                     }
                 };
@@ -1705,7 +1708,7 @@ impl App {
             return;
         }
         if let Some(err) = core::check_entries(&entries) {
-            self.set_status(err, Kind::Err);
+            self.report_error("Load failed", err);
             return;
         }
         let (total, binary) = self.apply_secret_doc(&doc, &entries, &sec, &ns);
@@ -1728,7 +1731,7 @@ impl App {
         }
         let text = match res {
             Err(e) => {
-                self.set_status(format!("Could not read file: {e}"), Kind::Err);
+                self.report_error("Could not read file", e);
                 return;
             }
             Ok(t) => t,
@@ -1752,7 +1755,7 @@ impl App {
                 let Some(doc) = self.secret_doc(&text, "import") else { return };
                 let entries = core::secret_entries(&doc);
                 if let Some(err) = core::check_entries(&entries) {
-                    self.set_status(err, Kind::Err);
+                    self.report_error("Import failed", err);
                     return;
                 }
                 let (total, binary) = self.apply_secret_doc(&doc, &entries, core::DEF_NAME, core::DEF_NS);
@@ -1763,24 +1766,24 @@ impl App {
     }
 
     /// Parse YAML and pick the Secret doc, reporting failures (with the
-    /// SealedSecret hint) in the status bar.
+    /// SealedSecret hint).
     fn secret_doc(&mut self, text: &str, verb: &str) -> Option<Value> {
         let docs = match core::parse_yaml_docs(text) {
             Ok(d) => d,
             Err(e) => {
-                self.set_status(format!("YAML parse error: {e}"), Kind::Err);
+                self.report_error("YAML parse error", e.to_string());
                 return None;
             }
         };
         let doc = core::select_secret_doc(&docs).cloned();
         if doc.is_none() {
             if core::has_sealed_secret(&docs) {
-                self.set_status(
+                self.report_error(
+                    &format!("Cannot {verb} a SealedSecret"),
                     format!("SealedSecret is encrypted — {verb} the plain Secret YAML it was sealed from"),
-                    Kind::Err,
                 );
             } else {
-                self.set_status("No Secret data/stringData found in file", Kind::Err);
+                self.report_error(&format!("Nothing to {verb}"), "No Secret data/stringData found in file".into());
             }
         }
         doc
