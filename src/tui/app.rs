@@ -1051,10 +1051,15 @@ impl App {
         match modal {
             Modal::Help => {} // any key closes
             Modal::Error { title, detail } => {
-                // Ctrl+Y copies the error (e.g. for a bug report); any other key closes.
+                // Ctrl+Y copies the error (e.g. for a bug report) and keeps the
+                // popup open; Ctrl+R closes it and retries the same way the
+                // login hint says to — reloading the kubeconfig so the
+                // credential plugin runs again; any other key closes.
                 if ctrl && k.code == KeyCode::Char('y') {
                     self.effects.push(Effect::Copy { text: detail.clone(), skipped: None });
                     self.modal = Some(Modal::Error { title, detail });
+                } else if ctrl && k.code == KeyCode::Char('r') {
+                    self.refresh_contexts();
                 }
             }
             Modal::Picker { target, mut picker } => {
@@ -2204,6 +2209,15 @@ mod tests {
         assert!(app.modal.is_some());
         app.on_key(key(KeyCode::Esc));
         assert!(app.modal.is_none());
+        // Ctrl+R (what the login hint tells the user to press) closes the popup
+        // and retries by reloading the kubeconfig.
+        app.report_error("Namespace fetch failed", detail.clone());
+        app.on_key(ctrl('r'));
+        assert!(app.modal.is_none());
+        let effects = take(&mut app);
+        assert!(effects.iter().any(|e| matches!(e, Effect::ClearClients)));
+        assert!(effects.iter().any(|e| matches!(e, Effect::LoadContexts { .. })));
+        assert_eq!(app.status.msg, "Reloading kubeconfig…");
         // A dialog the user is in isn't interrupted.
         app.modal = Some(Modal::Help);
         app.report_error("Load failed", "boom".into());

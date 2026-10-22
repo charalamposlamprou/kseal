@@ -504,6 +504,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Some(Modal::RowEdit { .. }) => "Tab key/value · Enter save · Ctrl+X show · Esc cancel",
         Some(Modal::Overwrite { .. }) => "y overwrite · any other key cancels",
         Some(Modal::Help) => "any key closes",
+        Some(Modal::Error { ref detail, .. }) if detail.starts_with(LOGIN_FAILED) => {
+            "Ctrl+R retry · Ctrl+Y copy the error · any other key closes"
+        }
         Some(Modal::Error { .. }) => "Ctrl+Y copy the error · any other key closes",
         None => match app.focus() {
             Focus::SvIn | Focus::SvOut => "Ctrl+X show/hide · Ctrl+Y copy base64 · Ctrl+K clear",
