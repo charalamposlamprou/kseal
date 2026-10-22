@@ -113,7 +113,7 @@ struct Kube {
 impl Kube {
     async fn client(&self, ctx: &str) -> Result<Client> {
         let cell = self.cells.lock().expect("client cache poisoned").entry(ctx.to_string()).or_default().clone();
-        let c = cell.get_or_try_init(|| async { cluster::client_for(Some(ctx)).await.map(|(c, _)| c) }).await?;
+        let c = cell.get_or_try_init(|| async { cluster::client_for(Some(ctx), false).await.map(|(c, _)| c) }).await?;
         Ok(c.clone())
     }
     fn clear(&self) {
@@ -133,6 +133,11 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 
 fn msg_err(e: anyhow::Error) -> String {
     format!("{e:#}")
+}
+
+/// [`msg_err`] for a call on cluster context `ctx` (names its login plugin).
+fn cluster_err(ctx: &str) -> impl Fn(anyhow::Error) -> String + '_ {
+    move |e| cluster::describe_error(&e, Some(ctx))
 }
 
 fn read_text(path: &str) -> Result<String> {
@@ -162,19 +167,23 @@ impl Executor<'_> {
             }),
             Effect::LoadNamespaces { tok, ctx } => self.spawn(async move {
                 let res = timed(async { cluster::list_namespaces(&kube.client(&ctx).await?).await }).await;
-                Msg::Namespaces { tok, ctx, res: res.map_err(msg_err) }
+                let res = res.map_err(cluster_err(&ctx));
+                Msg::Namespaces { tok, ctx, res }
             }),
             Effect::LoadSecrets { tok, ctx, ns } => self.spawn(async move {
                 let res = timed(async { cluster::list_secrets(&kube.client(&ctx).await?, &ns).await }).await;
-                Msg::Secrets { tok, ctx, ns, res: res.map_err(msg_err) }
+                let res = res.map_err(cluster_err(&ctx));
+                Msg::Secrets { tok, ctx, ns, res }
             }),
             Effect::DetectController { tok, ctx, ctl_gen } => self.spawn(async move {
                 let res = timed(async { cluster::detect_controller(&kube.client(&ctx).await?).await }).await;
-                Msg::Controller { tok, ctx, ctl_gen, res: res.map_err(msg_err) }
+                let res = res.map_err(cluster_err(&ctx));
+                Msg::Controller { tok, ctx, ctl_gen, res }
             }),
             Effect::FetchTemplate { tok, ctx, ns, sec, out_gen, kv_gen } => self.spawn(async move {
                 let res = timed(async { cluster::get_secret(&kube.client(&ctx).await?, &ns, &sec).await }).await;
-                Msg::Template { tok, ctx, ns, sec, out_gen, kv_gen, res: res.map_err(msg_err) }
+                let res = res.map_err(cluster_err(&ctx));
+                Msg::Template { tok, ctx, ns, sec, out_gen, kv_gen, res }
             }),
             Effect::ReadFile { tok, purpose, path, out_gen, kv_gen } => self.spawn(async move {
                 let p = path.clone();
@@ -207,7 +216,7 @@ impl Executor<'_> {
                     })
                     .await
                 };
-                Msg::Sealed { out_gen, res: res.await.map_err(msg_err) }
+                Msg::Sealed { out_gen, res: res.await.map_err(cluster_err(&ctx)) }
             }),
             Effect::Validate { out_gen, sealed, ctx, ctl: (ns, name) } => self.spawn(async move {
                 let res = async {
@@ -218,7 +227,7 @@ impl Executor<'_> {
                         .context("no SealedSecret in the output pane")?;
                     timed(async { cluster::verify(&kube.client(&ctx).await?, &ns, &name, doc).await }).await
                 };
-                Msg::Validated { out_gen, res: res.await.map_err(msg_err) }
+                Msg::Validated { out_gen, res: res.await.map_err(cluster_err(&ctx)) }
             }),
             Effect::Copy { text, skipped } => {
                 if clipboard::prefer_osc52() {

@@ -204,6 +204,7 @@ pub enum Modal {
     RowEdit { idx: Option<usize>, key: Input, value: Input, on_value: bool, shown: bool },
     Overwrite { path: String, content: String, what: SaveWhat, skipped: usize },
     Help,
+    Error { title: String, detail: String },
 }
 
 /// Side effects for the event loop to run. Results come back as [`Msg`]s.
@@ -546,6 +547,17 @@ impl App {
 
     pub fn set_status(&mut self, msg: impl Into<String>, kind: Kind) {
         self.status_for(msg, kind, STATUS_DURATION);
+    }
+
+    /// An operation failed (cluster, file, editor, seal…): the last line of
+    /// the error (the cause) goes to the status line and the whole of it to a
+    /// popup, unless another dialog is open (it isn't interrupted; the first
+    /// error popup stays). Hints like "Generate YAML first" stay status-only.
+    fn report_error(&mut self, title: &str, detail: String) {
+        self.set_status(format!("{title}: {}", last_line(&detail)), Kind::Err);
+        if self.modal.is_none() {
+            self.modal = Some(Modal::Error { title: title.into(), detail });
+        }
     }
 
     fn status_for(&mut self, msg: impl Into<String>, kind: Kind, d: Duration) {
@@ -1017,6 +1029,18 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match modal {
             Modal::Help => {} // any key closes
+            Modal::Error { title, detail } => {
+                // Ctrl+Y copies the error (e.g. for a bug report) and keeps the
+                // popup open; Ctrl+R closes it and retries the same way the
+                // login hint says to — reloading the kubeconfig so the
+                // credential plugin runs again; any other key closes.
+                if ctrl && k.code == KeyCode::Char('y') {
+                    self.effects.push(Effect::Copy { text: detail.clone(), skipped: None });
+                    self.modal = Some(Modal::Error { title, detail });
+                } else if ctrl && k.code == KeyCode::Char('r') {
+                    self.refresh_contexts();
+                }
+            }
             Modal::Picker { target, mut picker } => {
                 if k.code == KeyCode::Esc {
                     return;
@@ -1302,7 +1326,7 @@ impl App {
             Focus::DvIn | Focus::DvOut => match self.dv_decoded() {
                 Ok(s) => (s, false),
                 Err(e) => {
-                    self.set_status(format!("Decode error: {e}"), Kind::Err);
+                    self.report_error("Decode failed", e.to_string());
                     return;
                 }
             },
@@ -1458,7 +1482,7 @@ impl App {
                     return;
                 }
                 match res {
-                    Err(e) => self.set_status(e, Kind::Err),
+                    Err(e) => self.report_error("Loading contexts failed", e),
                     Ok(c) => {
                         let n = c.names.len();
                         self.contexts = c.names;
@@ -1479,7 +1503,7 @@ impl App {
                     return;
                 }
                 match res {
-                    Err(e) => self.set_status(format!("Namespace fetch failed: {e}"), Kind::Err),
+                    Err(e) => self.report_error("Namespace fetch failed", e),
                     Ok(nss) => {
                         self.namespaces = nss;
                         if let Some(first) = self.namespaces.first().cloned() {
@@ -1494,7 +1518,7 @@ impl App {
                 }
                 match res {
                     // Say so — an empty picker would read as "no secrets here".
-                    Err(e) => self.set_status(format!("Secret list fetch failed: {e}"), Kind::Err),
+                    Err(e) => self.report_error("Secret list fetch failed", e),
                     Ok(secs) => {
                         self.secrets = secs;
                         self.enc_sec = self.secrets.first().cloned().unwrap_or_default();
@@ -1513,7 +1537,7 @@ impl App {
                 Err(WriteError::Exists(content)) => {
                     self.modal = Some(Modal::Overwrite { path, content, what, skipped });
                 }
-                Err(WriteError::Io(e)) => self.set_status(format!("Save failed: {e}"), Kind::Err),
+                Err(WriteError::Io(e)) => self.report_error("Save failed", e),
             },
             Msg::Sealed { out_gen, res } => {
                 self.sealing = false;
@@ -1526,7 +1550,7 @@ impl App {
                         self.sealed_ok = false;
                         self.sealed_out = format!("# seal error\n{e}\n");
                         self.sealed_scroll = Scroll::default();
-                        self.set_status(format!("Seal failed: {}", last_line(&e)), Kind::Err);
+                        self.report_error("Seal failed", e);
                     }
                     Ok(y) => {
                         self.sealed_ok = !y.trim().is_empty();
@@ -1535,7 +1559,7 @@ impl App {
                         if self.sealed_ok {
                             self.status_output("Sealed successfully", None);
                         } else {
-                            self.set_status("Sealing produced no output", Kind::Err);
+                            self.report_error("Seal failed", "Sealing produced no output".into());
                         }
                     }
                 }
@@ -1547,11 +1571,13 @@ impl App {
                 }
                 match res {
                     Ok(true) => self.set_status("Valid — the controller can decrypt this", Kind::Ok),
-                    Ok(false) => self.set_status(
-                        "Invalid seal — the controller cannot decrypt this (wrong key, scope, name or namespace)",
-                        Kind::Err,
+                    Ok(false) => self.report_error(
+                        "Invalid seal",
+                        "The controller cannot decrypt this SealedSecret.\n\
+                         Check that it was sealed with this controller's key, and its scope, name and namespace."
+                            .into(),
                     ),
-                    Err(e) => self.set_status(format!("Validation failed: {}", last_line(&e)), Kind::Err),
+                    Err(e) => self.report_error("Validation failed", e),
                 }
             }
             Msg::Copied { skipped, res } => match res {
@@ -1565,7 +1591,7 @@ impl App {
                 let edited = match res {
                     Ok(s) => core::editor_result(&original, s),
                     Err(e) => {
-                        self.set_status(format!("Editor: {e}"), Kind::Err);
+                        self.report_error("Editor failed", e);
                         return;
                     }
                 };
@@ -1603,7 +1629,7 @@ impl App {
             // protect — always report it, or an unreachable cluster would
             // retry forever with no explanation.
             Err(e) => {
-                self.set_status(format!("Controller detection failed: {e}"), Kind::Err);
+                self.report_error("Controller detection failed", e);
                 return;
             }
             Ok(found) => found,
@@ -1644,7 +1670,7 @@ impl App {
         }
         let doc = match res {
             Err(e) => {
-                self.set_status(format!("Load failed: {e}"), Kind::Err);
+                self.report_error("Load failed", e);
                 return;
             }
             Ok(doc) => doc,
@@ -1666,7 +1692,7 @@ impl App {
             return;
         }
         if let Some(err) = core::check_entries(&entries) {
-            self.set_status(err, Kind::Err);
+            self.report_error("Load failed", err);
             return;
         }
         let (total, binary) = self.apply_secret_doc(&doc, &entries, &sec, &ns);
@@ -1689,7 +1715,7 @@ impl App {
         }
         let text = match res {
             Err(e) => {
-                self.set_status(format!("Could not read file: {e}"), Kind::Err);
+                self.report_error("Could not read file", e);
                 return;
             }
             Ok(t) => t,
@@ -1713,7 +1739,7 @@ impl App {
                 let Some(doc) = self.secret_doc(&text, "import") else { return };
                 let entries = core::secret_entries(&doc);
                 if let Some(err) = core::check_entries(&entries) {
-                    self.set_status(err, Kind::Err);
+                    self.report_error("Import failed", err);
                     return;
                 }
                 let (total, binary) = self.apply_secret_doc(&doc, &entries, core::DEF_NAME, core::DEF_NS);
@@ -1724,24 +1750,24 @@ impl App {
     }
 
     /// Parse YAML and pick the Secret doc, reporting failures (with the
-    /// SealedSecret hint) in the status bar.
+    /// SealedSecret hint).
     fn secret_doc(&mut self, text: &str, verb: &str) -> Option<Value> {
         let docs = match core::parse_yaml_docs(text) {
             Ok(d) => d,
             Err(e) => {
-                self.set_status(format!("YAML parse error: {e}"), Kind::Err);
+                self.report_error("YAML parse error", e.to_string());
                 return None;
             }
         };
         let doc = core::select_secret_doc(&docs).cloned();
         if doc.is_none() {
             if core::has_sealed_secret(&docs) {
-                self.set_status(
+                self.report_error(
+                    &format!("Cannot {verb} a SealedSecret"),
                     format!("SealedSecret is encrypted — {verb} the plain Secret YAML it was sealed from"),
-                    Kind::Err,
                 );
             } else {
-                self.set_status("No Secret data/stringData found in file", Kind::Err);
+                self.report_error(&format!("Nothing to {verb}"), "No Secret data/stringData found in file".into());
             }
         }
         doc
@@ -2144,6 +2170,38 @@ mod tests {
         assert_eq!(rows(&app), vec![("K", "new", false)]);
         app.on_key(key(KeyCode::Char('d')));
         assert!(app.rows.is_empty());
+    }
+
+    #[test]
+    fn cluster_errors_open_a_popup_with_the_whole_message() {
+        let mut app = App::new();
+        let detail = "Cluster login failed: plugin failed:\nThe security token is expired".to_string();
+        app.report_error("Namespace fetch failed", detail.clone());
+        assert_eq!(app.status.msg, "Namespace fetch failed: The security token is expired");
+        assert!(matches!(&app.modal, Some(Modal::Error { detail: d, .. }) if *d == detail));
+        // A second failure (parallel calls) doesn't replace the popup.
+        app.report_error("Controller detection failed", "other".into());
+        assert!(matches!(&app.modal, Some(Modal::Error { title, .. }) if title == "Namespace fetch failed"));
+        // Ctrl+Y copies and keeps it open; any other key closes it.
+        app.on_key(ctrl('y'));
+        assert!(matches!(take(&mut app).pop(), Some(Effect::Copy { text, .. }) if text == detail));
+        assert!(app.modal.is_some());
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        // Ctrl+R (what the login hint tells the user to press) closes the popup
+        // and retries by reloading the kubeconfig.
+        app.report_error("Namespace fetch failed", detail.clone());
+        app.on_key(ctrl('r'));
+        assert!(app.modal.is_none());
+        let effects = take(&mut app);
+        assert!(effects.iter().any(|e| matches!(e, Effect::ClearClients)));
+        assert!(effects.iter().any(|e| matches!(e, Effect::LoadContexts { .. })));
+        assert_eq!(app.status.msg, "Reloading kubeconfig…");
+        // A dialog the user is in isn't interrupted.
+        app.modal = Some(Modal::Help);
+        app.report_error("Load failed", "boom".into());
+        assert!(matches!(app.modal, Some(Modal::Help)));
+        assert_eq!(app.status.msg, "Load failed: boom");
     }
 
     #[test]

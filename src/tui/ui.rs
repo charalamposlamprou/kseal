@@ -4,10 +4,13 @@
 use std::sync::OnceLock;
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Cell, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table, Wrap,
+};
 
 use super::app::{App, Focus, Kind, Modal, PathPurpose, PickTarget, SaveWhat, Tab};
 use super::widgets::{Input, centered, one_line};
+use crate::cluster::LOGIN_FAILED;
 use crate::core::EntryKind;
 
 struct Theme {
@@ -501,6 +504,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Some(Modal::RowEdit { .. }) => "Tab key/value · Enter save · Ctrl+X show · Esc cancel",
         Some(Modal::Overwrite { .. }) => "y overwrite · any other key cancels",
         Some(Modal::Help) => "any key closes",
+        Some(Modal::Error { ref detail, .. }) if detail.starts_with(LOGIN_FAILED) => {
+            "Ctrl+R retry · Ctrl+Y copy the error · any other key closes"
+        }
+        Some(Modal::Error { .. }) => "Ctrl+Y copy the error · any other key closes",
         None => match app.focus() {
             Focus::SvIn | Focus::SvOut => "Ctrl+X show/hide · Ctrl+Y copy base64 · Ctrl+K clear",
             Focus::DvIn | Focus::DvOut => "Ctrl+X show/hide · Ctrl+Y copy decoded · Ctrl+K clear",
@@ -614,6 +621,32 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
             f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
             None
         }
+        Modal::Error { title, detail } => {
+            // The summary in bold, then the cause (e.g. the plugin's own
+            // output). Control characters are made visible: raw, an escape
+            // sequence in a plugin's stderr would reach the terminal.
+            let mut lines: Vec<Line> = detail.lines().map(|l| Line::raw(one_line(l))).collect();
+            if let Some(first) = lines.first_mut() {
+                *first = first.clone().bold();
+            }
+            if detail.starts_with(LOGIN_FAILED) {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "Log in again with the tool your kubeconfig uses (e.g. `aws sso login`), then press Ctrl+R to retry.",
+                    Style::new().fg(t.accent),
+                ));
+            }
+            let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+            let w = 90.min(area.width.saturating_sub(4));
+            let h = para.line_count(w.saturating_sub(4)) as u16 + 4;
+            let r = centered(area, w, h);
+            f.render_widget(Clear, r);
+            let blk = modal_block(title).border_style(Style::new().fg(t.err)).padding(Padding::uniform(1));
+            let inner = blk.inner(r);
+            f.render_widget(blk, r);
+            f.render_widget(para, inner);
+            None
+        }
         Modal::Help => {
             let k = |key: &'static str, what: &'static str| {
                 Line::from(vec![Span::styled(format!("{key:<16}"), Style::new().fg(t.accent)), Span::raw(what)])
@@ -692,6 +725,25 @@ mod tests {
         app.sv_shown = true;
         let s = render(&mut app, 120, 40);
         assert!(s.contains("hunter2") && s.contains("aHVudGVyMg==") && s.contains("Ctrl+X hide"));
+    }
+
+    #[test]
+    fn error_popup_shows_the_cause_and_the_login_hint() {
+        let mut app = App::new();
+        let detail = format!(
+            "{LOGIN_FAILED}: the kubeconfig's credential plugin failed (exit status: 255):\nAn error occurred (ExpiredToken): The security token included in the request is expired"
+        );
+        app.modal = Some(Modal::Error { title: "Controller detection failed".into(), detail });
+        for (w, h) in [(60, 20), (20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+        let s = render(&mut app, 120, 40);
+        assert!(s.contains("Controller detection failed") && s.contains("The security token included in the request"));
+        assert!(s.contains("Ctrl+R to retry") && s.contains("Ctrl+Y copy the error"));
+        // Control characters never reach the terminal raw.
+        app.modal = Some(Modal::Error { title: "Load failed".into(), detail: "\x1b[31mred\x07".into() });
+        let s = render(&mut app, 120, 40);
+        assert!(s.contains("�[31mred�") && !s.contains('\x1b'));
     }
 
     #[test]
