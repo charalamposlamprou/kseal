@@ -80,8 +80,30 @@ pub fn describe_error(e: &anyhow::Error, context: Option<&str>) -> String {
             let hint = if io.kind() == std::io::ErrorKind::NotFound { " — is it installed and on PATH?" } else { "" };
             format!("{LOGIN_FAILED}: could not run {what}: {io}{hint}")
         }
-        _ => format!("{e:#}"),
+        _ => chain_text(e),
     }
+}
+
+/// `{e:#}`, except a Kubernetes API error is its message and HTTP status:
+/// kube's own text appends a debug dump of the whole Status object.
+fn chain_text(e: &anyhow::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in e.chain() {
+        if let Some(kube::Error::Api(st)) = cause.downcast_ref::<kube::Error>() {
+            parts.push(format!("{} (HTTP {} {})", st.message, st.code, st.reason));
+            // The service proxy's 503: the Service exists but no pod backs it.
+            if st.code == 503 && st.message.starts_with("no endpoints available") {
+                return format!(
+                    "{}\nThe controller has no running pod (scaled down, or its pods are Pending) — \
+                     check `kubectl get pods` in its namespace.",
+                    parts.join(": ")
+                );
+            }
+            break; // its source is the same Status again
+        }
+        parts.push(cause.to_string());
+    }
+    parts.join(": ")
 }
 
 /// The exec credential plugin command `context` (`None`: the current one)
@@ -244,6 +266,20 @@ mod tests {
         let msg = describe_error(&anyhow::Error::from(err), Some("no-such-context"));
         assert!(msg.starts_with("Cluster login failed: could not run the kubeconfig's credential plugin"), "{msg}");
         assert!(msg.ends_with("— is it installed and on PATH?"), "{msg}");
+        // An API error is its message and status, without kube's debug dump.
+        let st = kube::core::Status::failure(
+            "no endpoints available for service \"sealed-secrets-controller\"",
+            "ServiceUnavailable",
+        )
+        .with_code(503);
+        let err = anyhow::Error::from(kube::Error::Api(st.boxed()))
+            .context("fetching sealing cert from kube-system/sealed-secrets-controller");
+        assert_eq!(
+            describe_error(&err, None),
+            "fetching sealing cert from kube-system/sealed-secrets-controller: no endpoints available for service \
+             \"sealed-secrets-controller\" (HTTP 503 ServiceUnavailable)\nThe controller has no running pod (scaled \
+             down, or its pods are Pending) — check `kubectl get pods` in its namespace."
+        );
         // Anything else keeps the full chain.
         assert_eq!(describe_error(&anyhow!("boom").context("listing namespaces"), None), "listing namespaces: boom");
     }

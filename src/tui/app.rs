@@ -135,6 +135,23 @@ impl Status {
     }
 }
 
+/// The key a SealedSecret was sealed with: a context's controller, or a
+/// certificate file (which ignores the context).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SealedWith {
+    Controller { ctx: String, ns: String, name: String },
+    Cert(String),
+}
+
+impl std::fmt::Display for SealedWith {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Controller { ctx, ns, name } => write!(f, "{ns}/{name} in {ctx}"),
+            Self::Cert(path) => write!(f, "the certificate {path}"),
+        }
+    }
+}
+
 /// One key/value row of the Encode editor. A `binary` row holds its ORIGINAL
 /// base64 in `value`: it can't be edited as text, and Generate re-emits it
 /// verbatim (unless an editable row of the same key overrides it).
@@ -428,6 +445,12 @@ pub struct App {
     /// The sealed pane holds a real manifest (not an error dump). An explicit
     /// flag so Copy / Save / Validate never treat an error as a manifest.
     pub sealed_ok: bool,
+    /// What the sealed output was sealed with (shown on its pane; Validate
+    /// compares it with the controller it checks against).
+    pub sealed_with: Option<SealedWith>,
+    /// What the in-flight seal / validate uses.
+    sealing_with: Option<SealedWith>,
+    validating_with: Option<SealedWith>,
     pub sealed_scroll: Scroll,
     pub sealing: bool,
     pub validating: bool,
@@ -491,6 +514,9 @@ impl App {
             cert: Input::default(),
             sealed_out: String::new(),
             sealed_ok: false,
+            sealed_with: None,
+            sealing_with: None,
+            validating_with: None,
             sealed_scroll: Scroll::default(),
             sealing: false,
             validating: false,
@@ -620,6 +646,7 @@ impl App {
     fn invalidate_outputs(&mut self) {
         self.out_gen += 1;
         self.sealed_ok = false;
+        self.sealed_with = None;
         self.yaml_out.clear();
         self.sealed_out.clear();
         self.yaml_scroll = Scroll::default();
@@ -1352,7 +1379,9 @@ impl App {
             self.set_status("Nothing to copy", Kind::Dim);
             return;
         }
-        // Copied VERBATIM: a trailing newline can be part of a value (PEM).
+        // A trailing newline can be part of a value (PEM): kept. CRLF line
+        // breaks (e.g. a PEM created on Windows) are copied as LF.
+        let text = text.replace("\r\n", "\n");
         let skipped = qualify.then_some(self.skipped);
         self.effects.push(Effect::Copy { text, skipped });
     }
@@ -1438,6 +1467,11 @@ impl App {
             }
         }
         self.sealing = true;
+        self.sealing_with = Some(if cert.is_empty() {
+            SealedWith::Controller { ctx: self.seal_ctx.clone(), ns: ctl.0.clone(), name: ctl.1.clone() }
+        } else {
+            SealedWith::Cert(cert.clone())
+        });
         self.set_status("Sealing…", Kind::Dim);
         self.effects.push(Effect::Seal {
             out_gen: self.out_gen,
@@ -1464,6 +1498,8 @@ impl App {
             return;
         }
         self.validating = true;
+        self.validating_with =
+            Some(SealedWith::Controller { ctx: self.seal_ctx.clone(), ns: ctl.0.clone(), name: ctl.1.clone() });
         self.set_status("Validating…", Kind::Dim);
         self.effects.push(Effect::Validate {
             out_gen: self.out_gen,
@@ -1541,6 +1577,7 @@ impl App {
             },
             Msg::Sealed { out_gen, res } => {
                 self.sealing = false;
+                let with = self.sealing_with.take();
                 // A stale result describes the previous secret: don't resurrect it.
                 if self.discard_stale(out_gen, "sealing", "; seal again") {
                     return;
@@ -1548,16 +1585,18 @@ impl App {
                 match res {
                     Err(e) => {
                         self.sealed_ok = false;
+                        self.sealed_with = None;
                         self.sealed_out = format!("# seal error\n{e}\n");
                         self.sealed_scroll = Scroll::default();
                         self.report_error("Seal failed", e);
                     }
                     Ok(y) => {
                         self.sealed_ok = !y.trim().is_empty();
+                        self.sealed_with = with.filter(|_| self.sealed_ok);
                         self.sealed_out = y;
                         self.sealed_scroll = Scroll::default();
-                        if self.sealed_ok {
-                            self.status_output("Sealed successfully", None);
+                        if let Some(with) = self.sealed_with.clone() {
+                            self.status_output(&format!("Sealed with {with}"), None);
                         } else {
                             self.report_error("Seal failed", "Sealing produced no output".into());
                         }
@@ -1566,17 +1605,37 @@ impl App {
             }
             Msg::Validated { out_gen, res } => {
                 self.validating = false;
+                let against = self.validating_with.take();
                 if self.discard_stale(out_gen, "validation", "") {
                     return;
                 }
+                let against = against.map_or_else(|| "the controller".into(), |a| a.to_string());
+                // Validating against another key than the one sealed with is
+                // allowed (does cluster B decrypt it?) but must never pass for
+                // a check of the sealing cluster: say what was compared.
+                let sealed = self.sealed_with.as_ref().map(ToString::to_string);
+                let mismatch = sealed.as_ref().filter(|s| **s != against);
                 match res {
-                    Ok(true) => self.set_status("Valid — the controller can decrypt this", Kind::Ok),
-                    Ok(false) => self.report_error(
-                        "Invalid seal",
-                        "The controller cannot decrypt this SealedSecret.\n\
-                         Check that it was sealed with this controller's key, and its scope, name and namespace."
-                            .into(),
-                    ),
+                    Ok(true) => match mismatch {
+                        Some(s) => self.status_for(
+                            format!("Valid for {against} — but it was sealed with {s}"),
+                            Kind::Err,
+                            WARN_DURATION,
+                        ),
+                        None => self.set_status(format!("Valid — {against} can decrypt this"), Kind::Ok),
+                    },
+                    Ok(false) => {
+                        let why = match (mismatch, &self.sealed_with) {
+                            (Some(s), _) => format!("It was sealed with {s}, not {against}."),
+                            _ => "Check that it was sealed with this controller's key, and its scope, name and \
+                                  namespace."
+                                .into(),
+                        };
+                        self.report_error(
+                            "Invalid seal",
+                            format!("{against} cannot decrypt this SealedSecret.\n{why}"),
+                        );
+                    }
                     Err(e) => self.report_error("Validation failed", e),
                 }
             }
@@ -1980,6 +2039,79 @@ mod tests {
         let Some(Effect::Validate { out_gen, .. }) = take(&mut app).pop() else { panic!() };
         app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
         assert!(app.status.msg.starts_with("Valid"));
+    }
+
+    /// Seal (or validate) on the current context with a controller already
+    /// cached for `ctx`, answering with `res`.
+    fn seal_on(app: &mut App, ctx: &str) {
+        app.picked(PickTarget::SealCtx, ctx.into());
+        if let Some(Effect::DetectController { tok, ctx, ctl_gen }) = take(app).pop() {
+            let res = Ok(Some(("kube-system".into(), "sealed-secrets-controller".into())));
+            app.on_msg(Msg::Controller { tok, ctx, ctl_gen, res });
+        }
+    }
+
+    #[test]
+    fn validate_says_what_the_output_was_sealed_with() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\n");
+        seal_on(&mut app, "prod-a");
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(ctx, "prod-a");
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+        let a = "kube-system/sealed-secrets-controller in prod-a";
+        assert_eq!(app.sealed_with.as_ref().map(ToString::to_string).as_deref(), Some(a));
+        assert_eq!(app.status.msg, format!("Sealed with {a}"));
+
+        // The sealing context validates plainly.
+        app.on_key(ctrl('t'));
+        let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(ctx, "prod-a");
+        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        assert_eq!((app.status.msg.as_str(), app.status.kind), (&*format!("Valid — {a} can decrypt this"), Kind::Ok));
+
+        // Switching context keeps the output, and both answers name the mismatch.
+        seal_on(&mut app, "prod-b");
+        app.on_key(ctrl('t'));
+        let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(ctx, "prod-b");
+        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        assert_eq!(app.status.kind, Kind::Err, "valid for another cluster must not read as plain success");
+        assert!(app.status.msg.ends_with(&format!("but it was sealed with {a}")), "{}", app.status.msg);
+        app.on_key(ctrl('t'));
+        let Some(Effect::Validate { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::Validated { out_gen, res: Ok(false) });
+        let Some(Modal::Error { detail, .. }) = &app.modal else { panic!("no popup") };
+        assert!(detail.contains(&format!("It was sealed with {a}, not")), "{detail}");
+    }
+
+    #[test]
+    fn a_certificate_file_overrides_the_context_and_says_so() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\n");
+        app.cert.set("/tmp/other-cluster.pem");
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, cert, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(cert.as_deref(), Some("/tmp/other-cluster.pem"));
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+        assert_eq!(app.status.msg, "Sealed with the certificate /tmp/other-cluster.pem");
+        app.on_key(ctrl('t'));
+        let Some(Effect::Validate { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::Validated { out_gen, res: Ok(false) });
+        let Some(Modal::Error { detail, .. }) = &app.modal else { panic!("no popup") };
+        assert!(detail.contains("It was sealed with the certificate /tmp/other-cluster.pem, not"), "{detail}");
+    }
+
+    #[test]
+    fn copy_turns_crlf_into_lf() {
+        let mut app = App::new();
+        app.rows.push(Row { key: "k".into(), value: "-----BEGIN-----\r\nabc\r\n".into(), binary: false, shown: false });
+        app.rows_changed();
+        app.set_focus(Focus::Rows);
+        app.on_key(ctrl('y'));
+        assert!(matches!(take(&mut app).pop(), Some(Effect::Copy { text, .. }) if text == "-----BEGIN-----\nabc\n"));
+        assert_eq!(app.rows[0].value, "-----BEGIN-----\r\nabc\r\n", "the stored value is unchanged");
     }
 
     #[test]

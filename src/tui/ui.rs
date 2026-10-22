@@ -481,7 +481,11 @@ fn draw_seal(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Position
     spans.push(Span::styled(note, Style::new().fg(t.dim)));
     f.render_widget(Paragraph::new(Line::from(spans)), r4);
 
-    let blk = pane_block("SealedSecret", "Ctrl+Y copy · Ctrl+S save", fo == Focus::Sealed);
+    let title = match &app.sealed_with {
+        Some(with) => format!("SealedSecret — sealed with {with}"),
+        None => "SealedSecret".into(),
+    };
+    let blk = pane_block(&title, "Ctrl+Y copy · Ctrl+S save", fo == Focus::Sealed);
     app.view.sealed_h = blk.inner(out).height;
     let text = if app.sealed_out.is_empty() {
         Text::styled(
