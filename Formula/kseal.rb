@@ -1,25 +1,25 @@
 class Kseal < Formula
   desc "TUI and CLI for Kubernetes Secrets, with native SealedSecret sealing"
   homepage "https://github.com/charalamposlamprou/kseal"
-  version "0.1.3"
+  version "0.1.4"
   if OS.mac?
     if Hardware::CPU.arm?
-      url "https://github.com/charalamposlamprou/kseal/releases/download/v0.1.3/kseal-aarch64-apple-darwin.tar.xz"
-      sha256 "b6ec9b39be197f8d7d68f5b1f8c9a52f029044eb032e1c9561673a745eaa28e4"
+      url "https://github.com/charalamposlamprou/kseal/releases/download/v0.1.4/kseal-aarch64-apple-darwin.tar.xz"
+      sha256 "d9e16fcc15ed28694d0787bd2267937070b8ef8c6438b3c86b68d0ace29ac851"
     end
     if Hardware::CPU.intel?
-      url "https://github.com/charalamposlamprou/kseal/releases/download/v0.1.3/kseal-x86_64-apple-darwin.tar.xz"
-      sha256 "e6d9282d843659f6d8e8449f193ec8bd59e707f3aad6571aef073444a413026a"
+      url "https://github.com/charalamposlamprou/kseal/releases/download/v0.1.4/kseal-x86_64-apple-darwin.tar.xz"
+      sha256 "e9e37606133710bddc47bae1b11a9a5ce5be4d0afd9ed62f94463b8d311b648d"
     end
   end
   if OS.linux?
     if Hardware::CPU.arm?
-      url "https://github.com/charalamposlamprou/kseal/releases/download/v0.1.3/kseal-aarch64-unknown-linux-musl.tar.xz"
-      sha256 "6a321087d785eb6fc2a11fd72e99d2701502427c8a748efb93e41ef5d0ab1e6b"
+      url "https://github.com/charalamposlamprou/kseal/releases/download/v0.1.4/kseal-aarch64-unknown-linux-musl.tar.xz"
+      sha256 "34717034a3cda7d5c14e534bc32b8cfe006c649f5f2f0ec0faa6ecd27b01ba5f"
     end
     if Hardware::CPU.intel?
-      url "https://github.com/charalamposlamprou/kseal/releases/download/v0.1.3/kseal-x86_64-unknown-linux-gnu.tar.xz"
-      sha256 "4e41f1620475fdc10fa8f948cbf365b5b34c1f4e0d3c9837984ff44dec9838ef"
+      url "https://github.com/charalamposlamprou/kseal/releases/download/v0.1.4/kseal-x86_64-unknown-linux-gnu.tar.xz"
+      sha256 "92398ba2b19a5785323d54b40a1f3b69003e222b5e67f3d056e33f7a6f047ed5"
     end
   end
   license "MIT"
