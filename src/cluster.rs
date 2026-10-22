@@ -9,7 +9,8 @@
 use anyhow::{Context, Result, anyhow};
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use kube::api::ListParams;
-use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::client::AuthError;
+use kube::config::{ExecInteractiveMode, KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config};
 use serde_json::Value;
 
@@ -32,16 +33,50 @@ pub fn list_contexts() -> Result<Contexts> {
 
 /// A client for `context` (or the current context when `None`), plus that
 /// context's default namespace.
-pub async fn client_for(context: Option<&str>) -> Result<(Client, String)> {
+///
+/// `interactive: false` (the TUI) runs exec credential plugins (EKS
+/// `aws eks get-token`, …) with their stderr captured: inherited, it is
+/// printed straight over the TUI. It then shows up in [`describe_error`].
+pub async fn client_for(context: Option<&str>, interactive: bool) -> Result<(Client, String)> {
     let opts = KubeConfigOptions { context: context.map(str::to_owned), ..Default::default() };
     let mut cfg = Config::from_kubeconfig(&opts)
         .await
         .with_context(|| format!("loading kubeconfig context {}", context.unwrap_or("(current)")))?;
+    if let (false, Some(exec)) = (interactive, cfg.auth_info.exec.as_mut()) {
+        exec.interactive_mode = Some(ExecInteractiveMode::Never);
+    }
     // kube's default retry backs off up to 15 times on 503 — minutes for an
     // error that's permanent here (e.g. "no endpoints"). Fail fast instead.
     cfg.default_retry = false;
     let ns = cfg.default_namespace.clone();
     Ok((Client::try_from(cfg)?, ns))
+}
+
+/// Prefix of every [`describe_error`] message for a failed cluster login.
+pub const LOGIN_FAILED: &str = "Cluster login failed";
+
+/// An error from a cluster call, made readable. A failed exec credential
+/// plugin is reported by its own error output: kube's message is the whole
+/// command line with its environment plus the raw output, which buries the
+/// cause (e.g. an expired AWS token) past the edge of the screen.
+pub fn describe_error(e: &anyhow::Error) -> String {
+    let auth = e.chain().find_map(|c| c.downcast_ref::<AuthError>());
+    match auth {
+        Some(AuthError::AuthExecRun { status, out, .. }) => {
+            let said = [&out.stderr, &out.stdout]
+                .into_iter()
+                .map(|b| String::from_utf8_lossy(b).trim().to_string())
+                .find(|s| !s.is_empty());
+            match said {
+                Some(said) => format!("{LOGIN_FAILED}: the kubeconfig's credential plugin failed ({status}):\n{said}"),
+                None => format!("{LOGIN_FAILED}: the kubeconfig's credential plugin failed ({status})"),
+            }
+        }
+        Some(AuthError::AuthExecStart(io)) => {
+            format!("{LOGIN_FAILED}: could not run the kubeconfig's credential plugin: {io}")
+        }
+        _ => format!("{e:#}"),
+    }
 }
 
 pub async fn list_namespaces(client: &Client) -> Result<Vec<String>> {
@@ -156,6 +191,32 @@ mod tests {
             .map(|(name, port)| ServicePort { name: name.map(Into::into), port, ..Default::default() })
             .collect();
         Service { spec: Some(ServiceSpec { ports: Some(ports), ..Default::default() }), ..Default::default() }
+    }
+
+    #[test]
+    #[cfg(unix)] // ExitStatus::from_raw
+    fn describe_error_shows_the_plugin_output_not_the_command() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(255 << 8),
+            stdout: vec![],
+            stderr: b"\nAn error occurred (ExpiredToken): The security token included in the request is expired\n"
+                .to_vec(),
+        };
+        let err = kube::Error::Auth(AuthError::AuthExecRun {
+            cmd: r#"AWS_PROFILE="prod" KUBERNETES_EXEC_INFO="{}" "aws" "eks" "get-token""#.into(),
+            status: out.status,
+            out,
+        });
+        let msg = describe_error(&anyhow::Error::from(err).context("listing namespaces"));
+        assert_eq!(
+            msg,
+            "Cluster login failed: the kubeconfig's credential plugin failed (exit status: 255):\n\
+             An error occurred (ExpiredToken): The security token included in the request is expired"
+        );
+        assert!(!msg.contains("AWS_PROFILE"));
+        // Anything else keeps the full chain.
+        assert_eq!(describe_error(&anyhow!("boom").context("listing namespaces")), "listing namespaces: boom");
     }
 
     #[test]

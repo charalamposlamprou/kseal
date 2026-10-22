@@ -36,7 +36,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 http = "1"
 
 # TUI
-ratatui = "0.30"
+# line_count: size the error popup to its wrapped text.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 arboard = { version = "3", default-features = false }
 

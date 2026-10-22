@@ -113,7 +113,7 @@ struct Kube {
 impl Kube {
     async fn client(&self, ctx: &str) -> Result<Client> {
         let cell = self.cells.lock().expect("client cache poisoned").entry(ctx.to_string()).or_default().clone();
-        let c = cell.get_or_try_init(|| async { cluster::client_for(Some(ctx)).await.map(|(c, _)| c) }).await?;
+        let c = cell.get_or_try_init(|| async { cluster::client_for(Some(ctx), false).await.map(|(c, _)| c) }).await?;
         Ok(c.clone())
     }
     fn clear(&self) {
@@ -132,7 +132,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 }
 
 fn msg_err(e: anyhow::Error) -> String {
-    format!("{e:#}")
+    cluster::describe_error(&e)
 }
 
 fn read_text(path: &str) -> Result<String> {

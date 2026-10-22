@@ -211,7 +211,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Get { name, kube, namespace, format } => {
-            let (client, default_ns) = cluster::client_for(kube.context.as_deref()).await?;
+            let (client, default_ns) = cluster::client_for(kube.context.as_deref(), true).await?;
             let ns = namespace.unwrap_or(default_ns);
             let doc = cluster::get_secret(&client, &ns, &name).await?;
             let entries = core::secret_entries(&doc);
@@ -249,7 +249,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             let pem = match cert {
                 Some(p) => std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?,
                 None => {
-                    let (client, _) = cluster::client_for(kube.context.as_deref()).await?;
+                    let (client, _) = cluster::client_for(kube.context.as_deref(), true).await?;
                     let (ns, name) = controller(&client, &ctl).await?;
                     cluster::fetch_cert(&client, &ns, &name).await?
                 }
@@ -264,7 +264,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 .iter()
                 .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("SealedSecret"))
                 .context("no SealedSecret found in input")?;
-            let (client, _) = cluster::client_for(kube.context.as_deref()).await?;
+            let (client, _) = cluster::client_for(kube.context.as_deref(), true).await?;
             let (ns, name) = controller(&client, &ctl).await?;
             if cluster::verify(&client, &ns, &name, sealed).await? {
                 eprintln!("✓ controller {ns}/{name} can decrypt this SealedSecret");
@@ -275,7 +275,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Cert { kube, ctl } => {
-            let (client, _) = cluster::client_for(kube.context.as_deref()).await?;
+            let (client, _) = cluster::client_for(kube.context.as_deref(), true).await?;
             let (ns, name) = controller(&client, &ctl).await?;
             std::io::stdout().write_all(&cluster::fetch_cert(&client, &ns, &name).await?)?;
         }
@@ -290,7 +290,7 @@ fn main() -> Result<()> {
         None => tui::run(rt),
         Some(cmd) => {
             if let Err(e) = rt.block_on(run(cmd)) {
-                eprintln!("error: {e:#}");
+                eprintln!("error: {}", cluster::describe_error(&e));
                 std::process::exit(1);
             }
             Ok(())
