@@ -63,11 +63,9 @@ pub fn describe_error(e: &anyhow::Error) -> String {
     let auth = e.chain().find_map(|c| c.downcast_ref::<AuthError>());
     match auth {
         Some(AuthError::AuthExecRun { status, out, .. }) => {
-            let said = [&out.stderr, &out.stdout]
-                .into_iter()
-                .map(|b| String::from_utf8_lossy(b).trim().to_string())
-                .find(|s| !s.is_empty());
-            match said {
+            // stderr only: stdout is where a plugin writes credentials.
+            let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            match (!said.is_empty()).then_some(said) {
                 Some(said) => format!("{LOGIN_FAILED}: the kubeconfig's credential plugin failed ({status}):\n{said}"),
                 None => format!("{LOGIN_FAILED}: the kubeconfig's credential plugin failed ({status})"),
             }
@@ -215,6 +213,15 @@ mod tests {
              An error occurred (ExpiredToken): The security token included in the request is expired"
         );
         assert!(!msg.contains("AWS_PROFILE"));
+        // stdout is never shown: it's where a plugin writes the token.
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"{\"status\":{\"token\":\"k8s-aws-v1.secret\"}}".to_vec(),
+            stderr: vec![],
+        };
+        let err = kube::Error::Auth(AuthError::AuthExecRun { cmd: String::new(), status: out.status, out });
+        let msg = describe_error(&anyhow::Error::from(err));
+        assert_eq!(msg, "Cluster login failed: the kubeconfig's credential plugin failed (exit status: 1)");
         // Anything else keeps the full chain.
         assert_eq!(describe_error(&anyhow!("boom").context("listing namespaces")), "listing namespaces: boom");
     }
