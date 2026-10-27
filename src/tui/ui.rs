@@ -150,8 +150,10 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(format!(" F{} {} ", i + 1, tab.title()), style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::new().bg(t.bg)), area);
-    if !app.enc_ctx.is_empty() {
-        let ctx = format!("⎈ {} ", app.enc_ctx);
+    // The context the current tab works with: the Seal tab seals with its own.
+    let ctx = if app.tab == Tab::Seal { &app.seal_ctx } else { &app.enc_ctx };
+    if !ctx.is_empty() {
+        let ctx = format!("⎈ {ctx} ");
         let w = (ctx.chars().count() as u16).min(area.width / 2);
         let r = Rect { x: area.right() - w, width: w, ..area };
         f.render_widget(Paragraph::new(ctx).style(Style::new().bg(t.bg).fg(t.dim)).right_aligned(), r);
