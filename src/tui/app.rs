@@ -1626,6 +1626,18 @@ impl App {
                 if self.discard_stale(out_gen, "validation", "") {
                     return;
                 }
+                // The context changed while validating: the answer is the old
+                // context's, and a green "Valid" would read as the new one's.
+                let moved = match &against {
+                    Some(SealedWith::Controller { ctx, .. }) if *ctx != self.seal_ctx => Some(ctx.clone()),
+                    _ => None,
+                };
+                if let Some(was) = moved {
+                    let msg =
+                        format!("Context changed during validation (was {was}) — result discarded; validate again");
+                    self.status_for(msg, Kind::Err, WARN_DURATION);
+                    return;
+                }
                 let against = against.map_or_else(|| "the controller".into(), |a| a.to_string());
                 // Validating against another key than the one sealed with is
                 // allowed (does cluster B decrypt it?) but must never pass for
@@ -2153,6 +2165,33 @@ mod tests {
         app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
         assert_eq!(app.status.kind, Kind::Err);
         assert!(app.status.msg.contains("the context is now prod-a"), "{}", app.status.msg);
+    }
+
+    #[test]
+    fn validation_landing_after_a_context_switch_is_not_shown_as_valid() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\n");
+        seal_on(&mut app, "dev");
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+
+        // Validate on dev, switch to prod before dev answers.
+        app.on_key(ctrl('t'));
+        let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(ctx, "dev");
+        seal_on(&mut app, "prod");
+        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        assert_eq!(app.status.kind, Kind::Err, "{}", app.status.msg);
+        assert!(app.status.msg.contains("Context changed during validation (was dev)"), "{}", app.status.msg);
+
+        // Validating again checks prod, and names the mismatch.
+        app.on_key(ctrl('t'));
+        let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(ctx, "prod");
+        app.on_msg(Msg::Validated { out_gen, res: Ok(false) });
+        let Some(Modal::Error { detail, .. }) = &app.modal else { panic!("no popup") };
+        assert!(detail.contains("It was sealed with kube-system/sealed-secrets-controller in dev, not"), "{detail}");
     }
 
     #[test]
