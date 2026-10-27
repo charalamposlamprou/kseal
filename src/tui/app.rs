@@ -460,8 +460,10 @@ pub struct App {
     /// follows reads as a passed validation.
     validate_queued: bool,
     /// Ctrl+E was pressed on the Encode tab while it shows another context
-    /// than the Seal tab, which is the one sealed with.
-    sealing_beside: Option<String>,
+    /// than the Seal tab (load from one cluster, seal for another): the
+    /// status names both, so the Encode tab's context isn't taken for the
+    /// one sealed with.
+    sealing_from: Option<String>,
     pub sealed_scroll: Scroll,
     pub sealing: bool,
     pub validating: bool,
@@ -530,7 +532,7 @@ impl App {
             validating_with: None,
             seal_queued: false,
             validate_queued: false,
-            sealing_beside: None,
+            sealing_from: None,
             sealed_scroll: Scroll::default(),
             sealing: false,
             validating: false,
@@ -1493,7 +1495,7 @@ impl App {
             }
         }
         self.sealing = true;
-        self.sealing_beside = (cert.is_empty() && self.tab == Tab::Encode && self.enc_ctx != self.seal_ctx)
+        self.sealing_from = (cert.is_empty() && self.tab == Tab::Encode && self.enc_ctx != self.seal_ctx)
             .then(|| self.enc_ctx.clone())
             .filter(|c| !c.is_empty());
         self.sealing_with = Some(if cert.is_empty() {
@@ -1501,9 +1503,8 @@ impl App {
         } else {
             SealedWith::Cert(cert.clone())
         });
-        match &self.sealing_beside {
-            Some(enc) => self
-                .set_status(format!("Sealing for {} (the Seal tab's context, not {enc})…", self.seal_ctx), Kind::Dim),
+        match &self.sealing_from {
+            Some(enc) => self.set_status(format!("Sealing for {} (loaded from {enc})…", self.seal_ctx), Kind::Dim),
             None => self.set_status("Sealing…", Kind::Dim),
         }
         self.effects.push(Effect::Seal {
@@ -1616,7 +1617,7 @@ impl App {
             Msg::Sealed { out_gen, res } => {
                 self.sealing = false;
                 let with = self.sealing_with.take();
-                let beside = self.sealing_beside.take();
+                let from = self.sealing_from.take();
                 let validate = std::mem::take(&mut self.validate_queued);
                 // A stale result describes the previous secret: don't resurrect it.
                 if self.discard_stale(out_gen, "sealing", "; seal again") {
@@ -1641,15 +1642,12 @@ impl App {
                             // the old context's, which Validate would flag.
                             let msg = format!("Sealed with {with} — the context is now {}; seal again", self.seal_ctx);
                             self.status_for(msg, Kind::Err, WARN_DURATION);
-                        } else if let (Some(with), Some(enc)) = (self.sealed_with.clone(), beside) {
-                            // Sealed from the Encode tab, which shows another
-                            // context: a green status would read as sealed for it.
-                            let msg = format!(
-                                "Sealed with {with} — the Seal tab's context, not {enc} shown on Encode (F3 to change)"
-                            );
-                            self.status_for(msg, Kind::Err, WARN_DURATION);
                         } else if let Some(with) = self.sealed_with.clone() {
-                            self.status_output(&format!("Sealed with {with}"), None);
+                            let msg = match from {
+                                Some(enc) => format!("Sealed with {with} (loaded from {enc})"),
+                                None => format!("Sealed with {with}"),
+                            };
+                            self.status_output(&msg, None);
                             if validate {
                                 self.do_validate();
                             }
@@ -2632,27 +2630,29 @@ mod tests {
     }
 
     #[test]
-    fn sealing_from_encode_says_when_the_seal_tab_has_another_context() {
+    fn load_from_one_context_and_seal_for_another() {
         let mut app = connected();
         open_file(&mut app, "a.env", "A=1\n");
         seal_on(&mut app, "prod");
         assert_eq!((app.enc_ctx.as_str(), app.seal_ctx.as_str()), ("ctx", "prod"));
         app.tab = Tab::Encode;
         app.on_key(ctrl('e'));
-        assert!(app.status.msg.contains("Sealing for prod (the Seal tab's context, not ctx)"), "{}", app.status.msg);
+        assert_eq!(app.status.msg, "Sealing for prod (loaded from ctx)…");
         let Some(Effect::Seal { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
         assert_eq!(ctx, "prod");
-        app.on_key(ctrl('t'));
-        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
-        assert_eq!(app.status.kind, Kind::Err, "{}", app.status.msg);
-        assert!(app.status.msg.contains("the Seal tab's context, not ctx shown on Encode"), "{}", app.status.msg);
-        assert!(take(&mut app).is_empty(), "no green Valid may follow under the Encode tab's context");
-
-        // On the Seal tab, or with matching contexts, it's a plain seal.
-        app.tab = Tab::Seal;
-        app.on_key(ctrl('e'));
-        let Some(Effect::Seal { out_gen, .. }) = take(&mut app).pop() else { panic!() };
         app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
         assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
+        assert!(app.status.msg.ends_with("in prod (loaded from ctx)"), "{}", app.status.msg);
+
+        // Ctrl+T right after Ctrl+E validates against the context sealed for.
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_key(ctrl('t'));
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+        let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!("not validated") };
+        assert_eq!(ctx, "prod");
+        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
+        assert!(app.status.msg.contains("in prod can decrypt"), "{}", app.status.msg);
     }
 }
