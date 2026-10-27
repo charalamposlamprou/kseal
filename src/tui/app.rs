@@ -455,6 +455,15 @@ pub struct App {
     /// run it when the lookup lands rather than drop it (a dropped seal
     /// leaves the previous context's output in the pane).
     seal_queued: bool,
+    /// Validate was pressed while a seal was running (or queued): run it
+    /// when the seal lands. Dropped, the seal's green "Sealed with" that
+    /// follows reads as a passed validation.
+    validate_queued: bool,
+    /// Ctrl+E was pressed on the Encode tab while it shows another context
+    /// than the Seal tab (load from one cluster, seal for another): the
+    /// status names both, so the Encode tab's context isn't taken for the
+    /// one sealed with.
+    sealing_from: Option<String>,
     pub sealed_scroll: Scroll,
     pub sealing: bool,
     pub validating: bool,
@@ -522,6 +531,8 @@ impl App {
             sealing_with: None,
             validating_with: None,
             seal_queued: false,
+            validate_queued: false,
+            sealing_from: None,
             sealed_scroll: Scroll::default(),
             sealing: false,
             validating: false,
@@ -909,11 +920,17 @@ impl App {
 
     /// The user typed into a controller field: their value is now the newest,
     /// so drop any in-flight detection that would overwrite it.
+    /// A queued seal is cancelled, and so is a validation queued behind it.
+    fn cancel_queued(&mut self) {
+        self.seal_queued = false;
+        self.validate_queued = false;
+    }
+
     fn controller_edited(&mut self) {
         if self.ctl_pending.is_some() {
             self.claim("controller");
             self.ctl_pending = None;
-            self.seal_queued = false;
+            self.cancel_queued();
         }
     }
 
@@ -1202,13 +1219,13 @@ impl App {
                 // The controller is cluster-specific — detection refills it.
                 self.ctl_name.clear();
                 self.ctl_ns.clear();
-                self.seal_queued = false;
+                self.cancel_queued();
                 self.fetch_namespaces(v.clone());
                 self.detect_controller(v);
             }
             PickTarget::SealCtx => {
                 self.seal_ctx = v.clone();
-                self.seal_queued = false;
+                self.cancel_queued();
                 self.ctl_name.clear();
                 self.ctl_ns.clear();
                 self.detect_controller(v);
@@ -1478,12 +1495,18 @@ impl App {
             }
         }
         self.sealing = true;
+        self.sealing_from = (cert.is_empty() && self.tab == Tab::Encode && self.enc_ctx != self.seal_ctx)
+            .then(|| self.enc_ctx.clone())
+            .filter(|c| !c.is_empty());
         self.sealing_with = Some(if cert.is_empty() {
             SealedWith::Controller { ctx: self.seal_ctx.clone(), ns: ctl.0.clone(), name: ctl.1.clone() }
         } else {
             SealedWith::Cert(cert.clone())
         });
-        self.set_status("Sealing…", Kind::Dim);
+        match &self.sealing_from {
+            Some(enc) => self.set_status(format!("Sealing for {} (loaded from {enc})…", self.seal_ctx), Kind::Dim),
+            None => self.set_status("Sealing…", Kind::Dim),
+        }
         self.effects.push(Effect::Seal {
             out_gen: self.out_gen,
             yaml: self.yaml_out.clone(),
@@ -1495,6 +1518,11 @@ impl App {
     }
 
     fn do_validate(&mut self) {
+        if self.sealing || self.seal_queued {
+            self.validate_queued = true;
+            self.set_status("Validating once the seal is done…", Kind::Dim);
+            return;
+        }
         if !self.sealed_ok {
             self.set_status("Seal a secret first", Kind::Err);
             return;
@@ -1589,6 +1617,8 @@ impl App {
             Msg::Sealed { out_gen, res } => {
                 self.sealing = false;
                 let with = self.sealing_with.take();
+                let from = self.sealing_from.take();
+                let validate = std::mem::take(&mut self.validate_queued);
                 // A stale result describes the previous secret: don't resurrect it.
                 if self.discard_stale(out_gen, "sealing", "; seal again") {
                     return;
@@ -1613,7 +1643,14 @@ impl App {
                             let msg = format!("Sealed with {with} — the context is now {}; seal again", self.seal_ctx);
                             self.status_for(msg, Kind::Err, WARN_DURATION);
                         } else if let Some(with) = self.sealed_with.clone() {
-                            self.status_output(&format!("Sealed with {with}"), None);
+                            let msg = match from {
+                                Some(enc) => format!("Sealed with {with} (loaded from {enc})"),
+                                None => format!("Sealed with {with}"),
+                            };
+                            self.status_output(&msg, None);
+                            if validate {
+                                self.do_validate();
+                            }
                         } else {
                             self.report_error("Seal failed", "Sealing produced no output".into());
                         }
@@ -1717,7 +1754,7 @@ impl App {
             // protect — always report it, or an unreachable cluster would
             // retry forever with no explanation.
             Err(e) => {
-                self.seal_queued = false;
+                self.cancel_queued();
                 self.report_error("Controller detection failed", e);
                 return;
             }
@@ -1732,11 +1769,14 @@ impl App {
         }
         self.ctl_cache.insert(ctx.clone(), found.clone());
         let queued = std::mem::take(&mut self.seal_queued);
+        let validate = std::mem::take(&mut self.validate_queued);
         match found {
             Some((ns, name)) => {
                 self.apply_controller(ns, name);
                 if queued {
                     self.do_seal();
+                    // Only a seal that started can be validated after.
+                    self.validate_queued = validate && self.sealing;
                 }
             }
             None => {
@@ -2085,6 +2125,7 @@ mod tests {
     /// Seal (or validate) on the current context with a controller already
     /// cached for `ctx`, answering with `res`.
     fn seal_on(app: &mut App, ctx: &str) {
+        app.tab = Tab::Seal;
         app.picked(PickTarget::SealCtx, ctx.into());
         if let Some(Effect::DetectController { tok, ctx, ctl_gen }) = take(app).pop() {
             let res = Ok(Some(("kube-system".into(), "sealed-secrets-controller".into())));
@@ -2535,5 +2576,83 @@ mod tests {
         press(&mut app, &[End, Right]);
         assert_eq!(app.focus(), Focus::SecNs);
         assert_eq!((app.sec_name.value(), app.sec_ns.value()), ("my-secret", "default"), "arrows never edit");
+    }
+
+    #[test]
+    fn validate_pressed_while_sealing_runs_when_the_seal_lands() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\n");
+        seal_on(&mut app, "dev");
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_key(ctrl('t'));
+        assert!(take(&mut app).is_empty());
+        assert_eq!(app.status.msg, "Validating once the seal is done…");
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+        let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!("not validated") };
+        assert_eq!(ctx, "dev");
+        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
+
+        // A failed seal drops the queued validation.
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_key(ctrl('t'));
+        app.on_msg(Msg::Sealed { out_gen, res: Err("boom".into()) });
+        assert!(take(&mut app).is_empty());
+        assert!(!app.validate_queued);
+    }
+
+    #[test]
+    fn validate_queued_behind_a_queued_seal_follows_it() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\n");
+        app.tab = Tab::Seal;
+        app.picked(PickTarget::SealCtx, "dev".into());
+        let Some(Effect::DetectController { tok, ctx, ctl_gen }) = take(&mut app).pop() else { panic!() };
+        app.on_key(ctrl('e'));
+        app.on_key(ctrl('t'));
+        assert!(take(&mut app).is_empty());
+        let res = Ok(Some(("kube-system".into(), "sealed-secrets-controller".into())));
+        app.on_msg(Msg::Controller { tok, ctx, ctl_gen, res });
+        let Some(Effect::Seal { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(ctx, "dev");
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+        assert!(matches!(take(&mut app).pop(), Some(Effect::Validate { ctx, .. }) if ctx == "dev"));
+
+        // Switching context cancels both.
+        app.picked(PickTarget::SealCtx, "prod".into());
+        take(&mut app);
+        app.on_key(ctrl('e'));
+        app.on_key(ctrl('t'));
+        app.picked(PickTarget::SealCtx, "stage".into());
+        assert!(!app.seal_queued && !app.validate_queued);
+    }
+
+    #[test]
+    fn load_from_one_context_and_seal_for_another() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\n");
+        seal_on(&mut app, "prod");
+        assert_eq!((app.enc_ctx.as_str(), app.seal_ctx.as_str()), ("ctx", "prod"));
+        app.tab = Tab::Encode;
+        app.on_key(ctrl('e'));
+        assert_eq!(app.status.msg, "Sealing for prod (loaded from ctx)…");
+        let Some(Effect::Seal { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(ctx, "prod");
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+        assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
+        assert!(app.status.msg.ends_with("in prod (loaded from ctx)"), "{}", app.status.msg);
+
+        // Ctrl+T right after Ctrl+E validates against the context sealed for.
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_key(ctrl('t'));
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+        let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!("not validated") };
+        assert_eq!(ctx, "prod");
+        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
+        assert!(app.status.msg.contains("in prod can decrypt"), "{}", app.status.msg);
     }
 }
