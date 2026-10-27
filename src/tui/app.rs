@@ -451,6 +451,10 @@ pub struct App {
     /// What the in-flight seal / validate uses.
     sealing_with: Option<SealedWith>,
     validating_with: Option<SealedWith>,
+    /// Seal was pressed while the context's controller was being detected:
+    /// run it when the lookup lands rather than drop it (a dropped seal
+    /// leaves the previous context's output in the pane).
+    seal_queued: bool,
     pub sealed_scroll: Scroll,
     pub sealing: bool,
     pub validating: bool,
@@ -517,6 +521,7 @@ impl App {
             sealed_with: None,
             sealing_with: None,
             validating_with: None,
+            seal_queued: false,
             sealed_scroll: Scroll::default(),
             sealing: false,
             validating: false,
@@ -908,6 +913,7 @@ impl App {
         if self.ctl_pending.is_some() {
             self.claim("controller");
             self.ctl_pending = None;
+            self.seal_queued = false;
         }
     }
 
@@ -1196,11 +1202,13 @@ impl App {
                 // The controller is cluster-specific — detection refills it.
                 self.ctl_name.clear();
                 self.ctl_ns.clear();
+                self.seal_queued = false;
                 self.fetch_namespaces(v.clone());
                 self.detect_controller(v);
             }
             PickTarget::SealCtx => {
                 self.seal_ctx = v.clone();
+                self.seal_queued = false;
                 self.ctl_name.clear();
                 self.ctl_ns.clear();
                 self.detect_controller(v);
@@ -1442,12 +1450,15 @@ impl App {
 
     fn do_seal(&mut self) {
         if let Some(why) = self.seal_blocked() {
-            let msg = if why == "detecting controller…" {
-                "Detecting controller… try again in a moment".to_string()
+            if why == "detecting controller…" {
+                self.seal_queued = true;
+                self.set_status(
+                    format!("Detecting the controller for {}… sealing when found", self.seal_ctx),
+                    Kind::Dim,
+                );
             } else {
-                format!("Busy — {why}")
-            };
-            self.set_status(msg, Kind::Dim);
+                self.status_for(format!("Not sealed — still {why}"), Kind::Err, WARN_DURATION);
+            }
             return;
         }
         // Seals the Encode tab's YAML, generating it first if needed.
@@ -1595,7 +1606,13 @@ impl App {
                         self.sealed_with = with.filter(|_| self.sealed_ok);
                         self.sealed_out = y;
                         self.sealed_scroll = Scroll::default();
-                        if let Some(with) = self.sealed_with.clone() {
+                        let moved = matches!(&self.sealed_with, Some(SealedWith::Controller { ctx, .. }) if *ctx != self.seal_ctx);
+                        if let Some(with) = self.sealed_with.clone().filter(|_| moved) {
+                            // The context changed while sealing: the output is
+                            // the old context's, which Validate would flag.
+                            let msg = format!("Sealed with {with} — the context is now {}; seal again", self.seal_ctx);
+                            self.status_for(msg, Kind::Err, WARN_DURATION);
+                        } else if let Some(with) = self.sealed_with.clone() {
                             self.status_output(&format!("Sealed with {with}"), None);
                         } else {
                             self.report_error("Seal failed", "Sealing produced no output".into());
@@ -1688,6 +1705,7 @@ impl App {
             // protect — always report it, or an unreachable cluster would
             // retry forever with no explanation.
             Err(e) => {
+                self.seal_queued = false;
                 self.report_error("Controller detection failed", e);
                 return;
             }
@@ -1701,12 +1719,23 @@ impl App {
             return;
         }
         self.ctl_cache.insert(ctx.clone(), found.clone());
+        let queued = std::mem::take(&mut self.seal_queued);
         match found {
-            Some((ns, name)) => self.apply_controller(ns, name),
-            None => self.set_status(
-                format!("No sealed-secrets controller found in {ctx} — enter its name/NS, or use a certificate"),
-                Kind::Dim,
-            ),
+            Some((ns, name)) => {
+                self.apply_controller(ns, name);
+                if queued {
+                    self.do_seal();
+                }
+            }
+            None => {
+                let msg =
+                    format!("No sealed-secrets controller found in {ctx} — enter its name/NS, or use a certificate");
+                if queued {
+                    self.status_for(format!("Not sealed: {msg}"), Kind::Err, WARN_DURATION);
+                } else {
+                    self.set_status(msg, Kind::Dim);
+                }
+            }
         }
     }
 
@@ -2084,6 +2113,46 @@ mod tests {
         app.on_msg(Msg::Validated { out_gen, res: Ok(false) });
         let Some(Modal::Error { detail, .. }) = &app.modal else { panic!("no popup") };
         assert!(detail.contains(&format!("It was sealed with {a}, not")), "{detail}");
+    }
+
+    #[test]
+    fn seal_pressed_while_detecting_runs_once_the_controller_lands() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\n");
+        seal_on(&mut app, "prod-a");
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+
+        // Switch and seal at once: the seal waits for detection, not dropped.
+        app.picked(PickTarget::SealCtx, "prod-b".into());
+        let Some(Effect::DetectController { tok, ctx, ctl_gen }) = take(&mut app).pop() else { panic!() };
+        app.on_key(ctrl('e'));
+        assert!(take(&mut app).is_empty());
+        let res = Ok(Some(("kube-system".into(), "sealed-secrets-controller".into())));
+        app.on_msg(Msg::Controller { tok, ctx, ctl_gen, res });
+        let Some(Effect::Seal { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!("queued seal didn't run") };
+        assert_eq!(ctx, "prod-b");
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+        app.on_key(ctrl('t'));
+        let Some(Effect::Validate { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
+
+        // A queued seal is for the context it was pressed on.
+        app.picked(PickTarget::SealCtx, "prod-c".into());
+        take(&mut app);
+        app.on_key(ctrl('e'));
+        seal_on(&mut app, "prod-d");
+        assert!(take(&mut app).is_empty());
+
+        // Switching while a seal is in flight: the result says it's stale.
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, .. }) = take(&mut app).pop() else { panic!() };
+        app.picked(PickTarget::SealCtx, "prod-a".into());
+        app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
+        assert_eq!(app.status.kind, Kind::Err);
+        assert!(app.status.msg.contains("the context is now prod-a"), "{}", app.status.msg);
     }
 
     #[test]
