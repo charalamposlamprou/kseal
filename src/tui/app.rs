@@ -228,6 +228,8 @@ pub enum PathPurpose {
     Save(SaveWhat),
     /// A local manifest to compare the current output with.
     Diff(SaveWhat),
+    /// Where the GitOps wizard exports to (sets the Output field only).
+    ExportTo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1616,6 +1618,11 @@ impl App {
     }
 
     fn open_prompt(&mut self) {
+        if self.tab == Tab::GitOps && self.focus() == Focus::GoOut {
+            let init = self.go_out_or_default();
+            self.modal = Some(Modal::Path { purpose: PathPurpose::ExportTo, input: Input::new(init) });
+            return;
+        }
         let purpose = PathPurpose::Open(self.tab);
         let init = match self.tab {
             Tab::Seal => self.cert.value().to_string(),
@@ -1685,6 +1692,21 @@ impl App {
                     path,
                     out_gen: self.out_gen,
                     kv_gen: self.kv_edit_gen,
+                });
+            }
+            PathPurpose::ExportTo => self.set_go_out(&path),
+            PathPurpose::Save(SaveWhat::Export) => {
+                self.set_go_out(&path);
+                let content = self.go_yaml().unwrap_or_default().to_string();
+                // The Encode tab's skipped metadata only matters when it is the source.
+                let skipped = if self.go_source.value().trim().is_empty() { self.skipped } else { 0 };
+                self.effects.push(Effect::WriteFile {
+                    path,
+                    content,
+                    overwrite: false,
+                    what: SaveWhat::Export,
+                    skipped,
+                    confirmed: false,
                 });
             }
             PathPurpose::Save(what) => {
@@ -2212,22 +2234,29 @@ impl App {
             self.report_error("Export blocked", format!("Critical findings:\n{}", critical.join("\n")));
             return;
         }
-        let Some(content) = p.yaml.clone() else {
+        if p.yaml.is_none() {
             self.set_status("Nothing to export — the preview has no SealedSecret", Kind::Err);
             return;
-        };
-        if self.go_out.value().trim().is_empty() {
-            self.go_out.set(gitops::default_file_name(&p.name));
         }
-        let skipped = if self.go_source.value().trim().is_empty() { self.skipped } else { 0 };
-        self.effects.push(Effect::WriteFile {
-            path: self.go_out.value().trim().to_string(),
-            content,
-            overwrite: false,
-            what: SaveWhat::Export,
-            skipped,
-            confirmed: false,
-        });
+        // Ask where (pre-filled with the Output path; Tab completes).
+        let init = self.go_out_or_default();
+        self.modal = Some(Modal::Path { purpose: PathPurpose::Save(SaveWhat::Export), input: Input::new(init) });
+    }
+
+    fn go_out_or_default(&self) -> String {
+        match self.go_out.value().trim() {
+            "" => gitops::default_file_name(self.go_preview.as_ref().map_or("", |p| p.name.as_str())),
+            v => v.to_string(),
+        }
+    }
+
+    /// A path chosen in a prompt becomes the Output field (the user's now).
+    fn set_go_out(&mut self, path: &str) {
+        if self.go_out.value().trim() != path {
+            self.go_out.set(path);
+            self.go_out_edited();
+        }
+        self.go_out_auto = false;
     }
 
     /// Ctrl+D: compare the tab's output with a local manifest.
@@ -3582,6 +3611,11 @@ mod tests {
         assert_eq!(app.go_out.value(), "sealed-my-secret.yaml");
         assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
         app.on_key(ctrl('s'));
+        let Some(Modal::Path { purpose: PathPurpose::Save(SaveWhat::Export), input }) = &app.modal else {
+            panic!("Ctrl+S asks where to export")
+        };
+        assert_eq!(input.value(), "sealed-my-secret.yaml", "pre-filled with the Output path");
+        app.on_key(key(KeyCode::Enter));
         let Some(Effect::WriteFile {
             path,
             content,
@@ -3898,5 +3932,38 @@ mod tests {
         app.generate();
         app.row_saved(Some(0), "USER".into(), "bob".into(), false);
         assert!(!app.yaml_out.is_empty());
+    }
+
+    #[test]
+    fn gitops_choose_where_to_export() {
+        let mut app = previewed(vec![]);
+        // Ctrl+O on the Output field picks the destination only.
+        app.set_focus(Focus::GoOut);
+        app.on_key(ctrl('o'));
+        let Some(Modal::Path { purpose: PathPurpose::ExportTo, .. }) = &app.modal else {
+            panic!("no destination prompt")
+        };
+        app.on_key(ctrl('u'));
+        app.on_paste("repo/apps/db.yaml".into());
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.go_out.value(), "repo/apps/db.yaml");
+        assert!(take(&mut app).is_empty(), "choosing doesn't write");
+        // Ctrl+S asks, pre-filled with it; another answer is used and kept.
+        app.on_key(ctrl('s'));
+        let Some(Modal::Path { input, .. }) = &app.modal else { panic!() };
+        assert_eq!(input.value(), "repo/apps/db.yaml");
+        app.on_key(ctrl('u'));
+        app.on_paste("other/db.yaml".into());
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::WriteFile { path, what: SaveWhat::Export, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(path, "other/db.yaml");
+        assert_eq!(app.go_out.value(), "other/db.yaml");
+        // Esc cancels without writing; Ctrl+O elsewhere still picks the source.
+        app.on_key(ctrl('s'));
+        app.on_key(key(KeyCode::Esc));
+        assert!(take(&mut app).is_empty());
+        app.set_focus(Focus::GoSource);
+        app.on_key(ctrl('o'));
+        assert!(matches!(&app.modal, Some(Modal::Path { purpose: PathPurpose::Open(Tab::GitOps), .. })));
     }
 }

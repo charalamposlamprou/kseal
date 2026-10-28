@@ -58,7 +58,7 @@ Run `kseal` with no arguments. It reads your kubeconfig (`$KUBECONFIG` or
 | **Encode** | Live single-value base64 encoder. `.env` → Secret: open a `.env` or Secret YAML, or load a Secret from the cluster, then edit the key/value table, set name / namespace / type and generate the YAML. The type is guessed from the keys (`tls.crt` + `tls.key` → `kubernetes.io/tls`, …) until you pick one. |
 | **Decode** | Live single-value decoder. Open a Secret YAML (multi-document files and `kind: List` work) and get a masked table of its decoded values. |
 | **Seal** | Seal the Encode tab's YAML for a context: strict, namespace-wide or cluster-wide scope. The controller is auto-detected per context (editable), or you can seal offline with a certificate. **Validate** asks the controller whether it can decrypt the result. |
-| **GitOps** | Export wizard: pick the source (the Encode tab's Secret, or a Secret YAML file), the target namespace and scope, and the workflow (Generic, Argo CD, Flux). Ctrl+E seals and validates it, Ctrl+T asks the controller, Ctrl+D diffs it against the file already there, Ctrl+S exports it. |
+| **GitOps** | Export wizard: pick the source (the Encode tab's Secret, or a Secret YAML file), the target namespace and scope, and the workflow (Generic, Argo CD, Flux). Ctrl+E seals and validates it, Ctrl+T asks the controller, Ctrl+D diffs it against the file already there, and Ctrl+S asks where to export it (pre-filled, Tab completes; Ctrl+O on the Output field chooses the destination without exporting). |
 
 Values stay masked until you reveal them. Labels, annotations and `immutable`
 survive a load → generate round-trip, and binary values pass through

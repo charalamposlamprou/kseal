@@ -658,7 +658,8 @@ fn draw_gitops(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Positi
     *cur = field(f, n, "2 Namespace", W, ns, fo == Focus::GoNs).or(*cur);
     field(f, sc, "Scope", 5, Content::Picker(app.scope.as_str().into()), fo == Focus::GoScope);
     field(f, r3, "3 Workflow", W, Content::Picker(app.workflow.title().into()), fo == Focus::GoWorkflow);
-    let out = Content::Input { input: &app.go_out, masked: false, placeholder: "(sealed-<name>.yaml)" };
+    let out =
+        Content::Input { input: &app.go_out, masked: false, placeholder: "(sealed-<name>.yaml — Ctrl+O to choose)" };
     *cur = field(f, r4, "6 Output", W, out, fo == Focus::GoOut).or(*cur);
 
     let busy = app.go_busy;
@@ -745,7 +746,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Focus::GoSource => "Ctrl+O pick a Secret YAML · empty = the Encode tab's Secret · Ctrl+E preview",
             Focus::GoNs => "seal for this namespace · empty = the Secret's own · Ctrl+E preview",
             Focus::GoScope | Focus::GoWorkflow => "Enter pick · Ctrl+E preview",
-            Focus::GoOut => "the file to write (0600) · Ctrl+S export · Ctrl+D diff against it",
+            Focus::GoOut => "Ctrl+O choose where · Ctrl+S export (asks where) · Ctrl+D diff against it",
             Focus::GoPreview | Focus::GoFindings => {
                 "↑↓ scroll · Ctrl+E preview · Ctrl+T controller · Ctrl+D diff · Ctrl+S export"
             }
@@ -848,9 +849,10 @@ fn draw_simple_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 PathPurpose::Open(Tab::Encode) => "Open .env or Secret YAML",
                 PathPurpose::Open(Tab::Decode) => "Open Secret YAML",
                 PathPurpose::Open(Tab::Seal) => "Sealing certificate (PEM)",
-                PathPurpose::Open(Tab::GitOps) => "Secret YAML to export",
+                PathPurpose::Open(Tab::GitOps) => "Source: the Secret YAML to seal",
+                PathPurpose::ExportTo => "Export to (path; Tab completes)",
                 PathPurpose::Diff(_) => "Compare with a file — or leave it empty for the live Secret (read-only)",
-                PathPurpose::Save(SaveWhat::Export) => "Export SealedSecret as (written 0600)",
+                PathPurpose::Save(SaveWhat::Export) => "Export the SealedSecret to (written 0600; Tab completes)",
                 PathPurpose::Save(SaveWhat::Yaml) => "Save Secret YAML as (written 0600)",
                 PathPurpose::Save(SaveWhat::Sealed) => "Save SealedSecret as (written 0600)",
             };
