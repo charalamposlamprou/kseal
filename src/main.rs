@@ -5,6 +5,8 @@
 
 mod cluster;
 mod core;
+mod diff;
+mod locate;
 mod seal;
 mod tui;
 

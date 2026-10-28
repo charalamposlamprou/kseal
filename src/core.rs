@@ -387,7 +387,7 @@ impl Entry {
 }
 
 /// Scalar coercion for hand-authored YAML (`K: 0` parses as a number).
-fn scalar_string(v: &Value) -> String {
+pub fn scalar_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
@@ -447,7 +447,7 @@ pub fn first_invalid_key(entries: &[Entry]) -> Option<&str> {
 /// Expand `kind: List` wrappers (from `kubectl get -o yaml`, helm/argo
 /// renders) into their items, however deeply nested. Iterative, so absurd
 /// nesting can't overflow the stack. Non-mapping docs are dropped.
-fn flatten_list_docs(docs: &[Value]) -> Vec<&Value> {
+pub fn flatten_docs(docs: &[Value]) -> Vec<&Value> {
     let mut flat = vec![];
     let mut queue: VecDeque<&Value> = docs.iter().collect();
     while let Some(d) = queue.pop_front() {
@@ -465,7 +465,7 @@ fn flatten_list_docs(docs: &[Value]) -> Vec<&Value> {
     flat
 }
 
-fn kind_of(d: &Value) -> Option<&str> {
+pub fn kind_of(d: &Value) -> Option<&str> {
     d.get("kind").and_then(Value::as_str)
 }
 
@@ -473,7 +473,7 @@ fn kind_of(d: &Value) -> Option<&str> {
 /// always wins over a kind-less fragment carrying data/stringData; other
 /// kinds (ConfigMap, ...) are never picked.
 pub fn select_secret_doc(docs: &[Value]) -> Option<&Value> {
-    let docs = flatten_list_docs(docs);
+    let docs = flatten_docs(docs);
     docs.iter().find(|d| kind_of(d) == Some("Secret")).copied().or_else(|| {
         docs.iter()
             .find(|d| {
@@ -487,7 +487,7 @@ pub fn select_secret_doc(docs: &[Value]) -> Option<&Value> {
 
 /// Whether any doc is a SealedSecret — nothing to decode locally.
 pub fn has_sealed_secret(docs: &[Value]) -> bool {
-    flatten_list_docs(docs).iter().any(|d| kind_of(d) == Some("SealedSecret"))
+    flatten_docs(docs).iter().any(|d| kind_of(d) == Some("SealedSecret"))
 }
 
 /// Parse a (multi-document) YAML string into JSON values. The parser rejects
