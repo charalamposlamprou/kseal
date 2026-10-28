@@ -143,7 +143,7 @@ pub const TRACKING_LABELS: &[&str] = &["kustomize.toolkit.fluxcd.io/name", "kust
 
 /// The label the sealed-secrets controller puts on its own private sealing
 /// keys — and loads ANY Secret carrying it as one.
-pub const SEALING_KEY_LABEL: &str = "sealedsecrets.bitnami.com/sealed-secrets-key";
+pub use crate::seal::SEALING_KEY_LABEL;
 
 /// Secret size limit enforced by the API server (all values together).
 const MAX_SECRET_BYTES: usize = 1024 * 1024;
@@ -1067,8 +1067,13 @@ mod tests {
             "metadata": {"name": "sealed-secrets-keyv9tkg", "namespace": "kube-system", "labels": {SEALING_KEY_LABEL: "active"}}}));
         let f = secret_findings(&key);
         assert_eq!((f[0].rule, f[0].severity), ("secret.sealing-key", Severity::Critical));
-        let sealed =
-            crate::seal::seal_secret(&key, &crate::seal::tests::test_key().to_public_key(), Scope::Strict).unwrap();
+        // kseal refuses to seal it (seal::seal_secret); a file made by another
+        // tool can still hold one, so build it from a normal seal.
+        assert!(
+            crate::seal::seal_secret(&key, &crate::seal::tests::test_key().to_public_key(), Scope::Strict).is_err()
+        );
+        let mut sealed = sealed(Scope::Strict);
+        sealed["spec"]["template"]["metadata"]["labels"] = json!({SEALING_KEY_LABEL: "active"});
         assert!(
             sealed_findings(&sealed, None)
                 .iter()
