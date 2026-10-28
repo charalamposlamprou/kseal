@@ -2452,7 +2452,12 @@ impl App {
             Ok(()) => self.status_output(&format!("Saved {}", basename(&path)), Some(skipped)),
             Err(WriteError::Exists { content, existing }) => {
                 let pending = PendingWrite { path: path.clone(), content, what, skipped, confirmed: true };
-                match existing.as_deref().map(|old| diff::diff_texts(old, &pending.content)) {
+                // The plain Secret it was sealed from — only while the output
+                // being written is still the one on screen.
+                let source = (self.current_output(what) == Some(pending.content.as_str()))
+                    .then(|| self.output_source(what).map(str::to_string))
+                    .flatten();
+                match existing.as_deref().map(|old| diff::diff_texts_from(old, &pending.content, source.as_deref())) {
                     Some(Ok(d)) => {
                         let title = format!("{} exists — what overwriting it changes", basename(&path));
                         self.set_status(format!("{} exists: {} — y overwrites", basename(&path), d.summary), Kind::Dim);
@@ -4128,5 +4133,26 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         let Some(Effect::WriteFile { foreign, confirmed: false, .. }) = take(&mut app).pop() else { panic!() };
         assert_eq!(foreign, vec!["envs/dev/db.yaml"], "the executor's target check sees it");
+    }
+
+    #[test]
+    fn overwrite_diff_shows_the_new_values() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "USER=dummy-new\n");
+        seal_on(&mut app, "prod-a");
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, yaml, scope, .. }) = take(&mut app).pop() else { panic!() };
+        let pk = crate::seal::tests::test_key().to_public_key();
+        let sealed = crate::seal::seal_yaml(&yaml, &pk, scope).unwrap().0;
+        let old =
+            crate::seal::seal_yaml(&yaml.replace(&core::b64_encode("dummy-new"), &core::b64_encode("x")), &pk, scope)
+                .unwrap()
+                .0;
+        app.on_msg(Msg::Sealed { out_gen, res: Ok(sealed.clone()) });
+        let res = Err(WriteError::Exists { content: sealed, existing: Some(old) });
+        app.on_msg(Msg::Written { path: "s.yaml".into(), what: SaveWhat::Sealed, skipped: 0, res });
+        let Some(Modal::Diff { diff, confirm: Some(_), .. }) = &app.modal else { panic!("no diff") };
+        let shown: String = diff.lines.iter().map(|l| diff::render(l, true)).collect();
+        assert!(shown.contains("‹encrypted› → \"dummy-new\""), "{shown}");
     }
 }

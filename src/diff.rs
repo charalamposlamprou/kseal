@@ -423,6 +423,13 @@ pub fn diff_texts_from(old: &str, new: &str, source: Option<&str>) -> Result<Dif
             out.lines.push(Line::new(Tag::Removed, na.label(), None, None).note("whole resource removed"));
         }
     }
+    // Old values are ciphertext: say where the real ones are.
+    let old_encrypted =
+        out.lines.iter().any(|l| l.tag == Tag::Unknown && matches!(l.old, Some(Shown::Value(Val::Encrypted(_)))));
+    if old_encrypted {
+        let hint = "old values are encrypted — compare with the live Secret to see them (kseal: Ctrl+D, empty path)";
+        out.lines.push(Line::new(Tag::Note, hint, None, None));
+    }
     for (side, other) in [("old", a_other), ("new", b_other)] {
         if !other.is_empty() {
             let field = format!("{side}: ignored {} other document(s): {}", other.len(), other.join(", "));
@@ -557,6 +564,8 @@ mod tests {
         let d = diff_texts(&a, &b).unwrap();
         assert_eq!(changes(&d), vec![('~', "scope"), ('?', "data.PASSWORD"), ('?', "data.USER")]);
         assert!(text_of(&d, false).contains("may or may not have changed"));
+        assert!(text_of(&d, false).contains("# old values are encrypted"), "points at the live compare");
+        assert!(!text_of(&diff_texts(&secret(""), &b).unwrap(), false).contains("old values are encrypted"));
     }
 
     #[test]
