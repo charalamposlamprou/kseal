@@ -667,10 +667,17 @@ pub fn editor_result(original: &str, edited: String) -> String {
 
 /// Write secret-bearing content with owner-only (0600) permissions — forced
 /// even when overwriting an existing, world-readable file (the open mode only
-/// applies on create). Windows has no POSIX modes; the plain write is the best
-/// available there.
+/// applies on create). Never writes through a symbolic link: a planted link
+/// would redirect secret material elsewhere. Windows has no POSIX modes; the
+/// plain write is the best available there.
 pub fn write_secret_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other(format!(
+            "{} is a symbolic link — refusing to write through it",
+            path.display()
+        )));
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -1073,6 +1080,15 @@ mod tests {
         write_secret_file(&path, "password: café\n").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), "password: café\n".as_bytes());
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // A symlink (dangling or not) is never written through.
+        let target = dir.path().join("elsewhere.yaml");
+        let link = dir.path().join("link.yaml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_secret_file(&link, "x").unwrap_err().to_string().contains("symbolic link"));
+        assert!(!target.exists());
+        std::fs::write(&target, "keep").unwrap();
+        assert!(write_secret_file(&link, "x").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
     }
 
     #[test]

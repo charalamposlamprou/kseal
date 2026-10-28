@@ -23,6 +23,9 @@ use crate::core::{self, EntryKind};
 
 pub const ANN_NAMESPACE_WIDE: &str = "sealedsecrets.bitnami.com/namespace-wide";
 pub const ANN_CLUSTER_WIDE: &str = "sealedsecrets.bitnami.com/cluster-wide";
+/// The label the controller puts on its own private sealing keys — and it
+/// loads ANY Secret carrying it as one.
+pub const SEALING_KEY_LABEL: &str = "sealedsecrets.bitnami.com/sealed-secrets-key";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum Scope {
@@ -130,6 +133,17 @@ fn secret_parts(doc: &Value) -> Result<SecretParts<'_>> {
 /// Seal a Secret doc into a SealedSecret (as a JSON value, ready to be
 /// rendered as YAML or POSTed to the controller's /v1/verify).
 pub fn seal_secret(doc: &Value, pubkey: &RsaPublicKey, scope: Scope) -> Result<Value> {
+    // Whatever controller it'd be sealed for: the master key decrypts every
+    // SealedSecret, can't be recovered once sealed with itself, and applied
+    // its label makes the controller load the copy as a sealing key.
+    if doc.pointer("/metadata/labels").and_then(Value::as_object).is_some_and(|l| l.contains_key(SEALING_KEY_LABEL)) {
+        let (name, ns, _) = core::secret_identity(doc);
+        bail!(
+            "refusing to seal {ns}/{name}: it is the sealed-secrets controller's own private sealing key \
+             (label {SEALING_KEY_LABEL}). It decrypts every SealedSecret and must never go into Git, sealed or not — \
+             back it up offline instead"
+        );
+    }
     let s = secret_parts(doc)?;
     if scope != Scope::ClusterWide && s.namespace.is_empty() {
         bail!("{} scope needs metadata.namespace", scope.as_str());
@@ -346,6 +360,22 @@ pub(crate) mod tests {
         assert!(seal_yaml(no_ns, &pk, Scope::ClusterWide).is_ok());
         let sealed = "kind: SealedSecret\nspec: {}\n";
         assert!(seal_yaml(sealed, &pk, Scope::Strict).unwrap_err().to_string().contains("already"));
+    }
+
+    #[test]
+    fn refuses_to_seal_the_controllers_own_key() {
+        let pk = test_key().to_public_key();
+        let key = format!(
+            "apiVersion: v1\nkind: Secret\nmetadata:\n  name: sealed-secrets-keyabc12\n  namespace: kube-system\n  labels:\n    {SEALING_KEY_LABEL}: active\ntype: kubernetes.io/tls\nstringData:\n  tls.crt: x\n  tls.key: dummy-not-a-key\n"
+        );
+        for scope in Scope::ALL {
+            let err = seal_yaml(&key, &pk, scope).unwrap_err().to_string();
+            assert!(err.contains("refusing to seal kube-system/sealed-secrets-keyabc12"), "{err}");
+            assert!(!err.contains("dummy-not-a-key"), "no values in the error");
+        }
+        // Compromised (label value) or not, the label alone decides; others are fine.
+        assert!(seal_yaml(&key.replace(": active", ": compromised"), &pk, Scope::Strict).is_err());
+        assert!(seal_yaml(&key.replace(SEALING_KEY_LABEL, "app"), &pk, Scope::Strict).is_ok());
     }
 
     /// Cross-check against Go's crypto/rsa + crypto/cipher — the exact
