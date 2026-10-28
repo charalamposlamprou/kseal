@@ -2310,12 +2310,14 @@ impl App {
     }
 
     /// A path chosen in a prompt becomes the Output field (the user's now).
+    /// Accepting the pre-filled value unchanged is not a choice: auto-pick
+    /// stays on, so a later preview can still move it to the found manifest.
     fn set_go_out(&mut self, path: &str) {
         if self.go_out.value().trim() != path {
             self.go_out.set(path);
             self.go_out_edited();
+            self.go_out_auto = false;
         }
-        self.go_out_auto = false;
     }
 
     /// Ctrl+D: compare the tab's output with a local manifest.
@@ -4083,6 +4085,30 @@ mod tests {
         // A path the user chose is kept on the next preview.
         land(&mut app, vec!["c/s.yaml"]);
         assert_eq!(app.go_out.value(), "b/s.yaml");
+    }
+
+    #[test]
+    fn accepting_the_default_path_keeps_auto_pick_on() {
+        let mut app = previewed(vec![]);
+        assert_eq!(app.go_out.value(), "sealed-my-secret.yaml");
+        app.on_key(ctrl('s'));
+        app.on_key(key(KeyCode::Enter)); // the pre-filled default, unchanged
+        take(&mut app);
+        app.picked(PickTarget::Workflow, "Flux".into());
+        app.on_key(ctrl('e'));
+        let Some(Effect::GitopsPreview { out, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(out, "", "still kseal's to pick — the found manifest can take over");
+        // A changed path is the user's.
+        let mut app = previewed(vec![]);
+        app.on_key(ctrl('s'));
+        app.on_key(ctrl('u'));
+        app.on_paste("mine.yaml".into());
+        app.on_key(key(KeyCode::Enter));
+        take(&mut app);
+        app.picked(PickTarget::Workflow, "Flux".into());
+        app.on_key(ctrl('e'));
+        let Some(Effect::GitopsPreview { out, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(out, "mine.yaml");
     }
 
     #[test]

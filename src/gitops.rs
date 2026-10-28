@@ -443,7 +443,29 @@ pub fn choose_output(found: &[FoundManifest], given: &str, name: &str, res: &str
                 remediation: String::new(),
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut notes = notes;
+    // Writing elsewhere would leave two manifests for one resource (GitOps
+    // tools apply both): say where this cluster's already is.
+    if let [only] = mine.as_slice() {
+        let canon = |p: &str| {
+            let p = Path::new(p);
+            std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+        };
+        if !given.is_empty() && canon(given) != canon(&only.path) {
+            notes.push(Finding {
+                severity: Severity::Medium,
+                rule: "export.not-existing-file",
+                resource: res.to_string(),
+                key: None,
+                message: format!(
+                    "Output is {given}, but this cluster's manifest for it is {} — two files would define one resource",
+                    only.path
+                ),
+                remediation: "Ctrl+O on Output and pick it (or Ctrl+K to let kseal pick)".into(),
+            });
+        }
+    }
     (out, notes)
 }
 
@@ -657,8 +679,14 @@ mod tests {
         assert_eq!(choose_output(&[f("a.yaml", Owner::Unknown)], "", "db", res).0, "sealed-db.yaml");
         let two = [f("a.yaml", Owner::This), f("b.yaml", Owner::This)];
         assert_eq!(choose_output(&two, "", "db", res).0, "sealed-db.yaml");
-        // A path the user chose stays.
-        assert_eq!(choose_output(&found, "mine.yaml", "db", res).0, "mine.yaml");
+        // A path the user chose stays, with a nudge to the existing file.
+        let (out, notes) = choose_output(&found, "mine.yaml", "db", res);
+        assert_eq!(out, "mine.yaml");
+        let nudge = notes.iter().find(|n| n.rule == "export.not-existing-file").expect("nudge");
+        assert_eq!(nudge.severity, Severity::Medium);
+        assert!(nudge.message.contains("envs/prod/db.yaml"));
+        let (_, notes) = choose_output(&found, "envs/prod/db.yaml", "db", res);
+        assert!(notes.iter().all(|n| n.rule != "export.not-existing-file"), "no nudge when it is that file");
 
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("dev.yaml");
