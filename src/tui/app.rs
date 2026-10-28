@@ -876,6 +876,7 @@ impl App {
     /// A row was added, removed or really edited.
     fn rows_changed(&mut self) {
         self.kv_edit_gen += 1;
+        self.secret_edited();
         if self.type_auto {
             self.sec_type = core::guess_secret_type(self.rows.iter().map(|r| r.key.trim())).to_string();
         }
@@ -885,6 +886,15 @@ impl App {
             None => self.rows_state.select(Some(0)),
             Some(i) if i >= n => self.rows_state.select(Some(n - 1)),
             _ => {}
+        }
+    }
+
+    /// The Secret in the editor changed (rows, name, namespace, type): the
+    /// generated YAML — and everything sealed from it — is out of date.
+    /// Dropped, so Seal / Preview regenerate instead of sealing the old one.
+    fn secret_edited(&mut self) {
+        if !self.yaml_out.is_empty() {
+            self.invalidate_outputs();
         }
     }
 
@@ -1109,11 +1119,11 @@ impl App {
             Focus::DvIn => {
                 self.dv_in.handle(k);
             }
-            Focus::SecName => {
-                self.sec_name.handle(k);
-            }
-            Focus::SecNs => {
-                self.sec_ns.handle(k);
+            Focus::SecName | Focus::SecNs => {
+                let input = if f == Focus::SecName { &mut self.sec_name } else { &mut self.sec_ns };
+                if input.handle(k) {
+                    self.secret_edited();
+                }
             }
             Focus::Cert => {
                 self.cert.handle(k);
@@ -1304,8 +1314,14 @@ impl App {
             None => match self.focus() {
                 Focus::SvIn => self.sv_in.insert_str(&value),
                 Focus::DvIn => self.dv_in.insert_str(&value),
-                Focus::SecName => self.sec_name.insert_str(&line),
-                Focus::SecNs => self.sec_ns.insert_str(&line),
+                Focus::SecName => {
+                    self.sec_name.insert_str(&line);
+                    self.secret_edited();
+                }
+                Focus::SecNs => {
+                    self.sec_ns.insert_str(&line);
+                    self.secret_edited();
+                }
                 Focus::Cert => self.cert.insert_str(&line),
                 Focus::CtlName => {
                     self.ctl_name.insert_str(&line);
@@ -1582,6 +1598,9 @@ impl App {
             }
             PickTarget::EncSecret => self.enc_sec = v,
             PickTarget::SecType => {
+                if self.sec_type != v {
+                    self.secret_edited();
+                }
                 self.sec_type = v;
                 self.type_auto = false;
             }
@@ -3838,5 +3857,46 @@ mod tests {
         assert!(shown.contains("\"dummy-old\" → \"dummy-new\""), "{shown}");
         let masked: String = diff.lines.iter().map(|l| diff::render(l, false)).collect();
         assert!(!masked.contains("dummy-"), "masked until Ctrl+X");
+    }
+
+    #[test]
+    fn editing_the_secret_drops_stale_yaml_so_previews_use_the_edit() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "USER=alice\n");
+        app.tab = Tab::GitOps;
+        app.on_key(ctrl('e'));
+        let Some(Effect::GitopsPreview { go_gen, source: Source::Yaml(first), .. }) = take(&mut app).pop() else {
+            panic!()
+        };
+        assert!(first.contains(&core::b64_encode("alice")));
+        // Edit USER on the Encode tab without pressing Ctrl+G.
+        app.row_saved(Some(0), "USER".into(), "bob".into(), false);
+        assert!(app.yaml_out.is_empty() && !app.sealed_ok, "the old YAML (and anything sealed from it) is dropped");
+        let p = GoPreview {
+            yaml: Some("y".into()),
+            findings: vec![],
+            name: "n".into(),
+            namespace: "d".into(),
+            out: "o".into(),
+            source_yaml: None,
+        };
+        app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
+        assert!(app.go_preview.is_none(), "the preview of the old YAML lands stale");
+        app.on_key(ctrl('e'));
+        let Some(Effect::GitopsPreview { source: Source::Yaml(second), .. }) = take(&mut app).pop() else { panic!() };
+        assert!(second.contains(&core::b64_encode("bob")), "the preview seals the edited Secret");
+        // Name / namespace / type edits too.
+        app.generate();
+        app.tab = Tab::Encode;
+        app.set_focus(Focus::SecNs);
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.yaml_out.is_empty());
+        app.generate();
+        app.picked(PickTarget::SecType, "kubernetes.io/basic-auth".into());
+        assert!(app.yaml_out.is_empty());
+        // A same-value save changes nothing.
+        app.generate();
+        app.row_saved(Some(0), "USER".into(), "bob".into(), false);
+        assert!(!app.yaml_out.is_empty());
     }
 }
