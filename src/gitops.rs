@@ -234,6 +234,24 @@ fn read_capped(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok()
 }
 
+/// `path` absolute (its directory resolved, so a not-yet-existing file
+/// works too), with the home directory shown as `~` — what findings name.
+pub fn pretty_path(path: &Path) -> String {
+    let abs = match (path.parent().filter(|p| !p.as_os_str().is_empty()), path.file_name()) {
+        (Some(dir), Some(f)) => std::fs::canonicalize(dir).map(|d| d.join(f)).unwrap_or_else(|_| path.to_path_buf()),
+        (None, Some(f)) => std::env::current_dir().map(|d| d.join(f)).unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    };
+    let s = abs.display().to_string();
+    match std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok()) {
+        Some(home) => match abs.strip_prefix(&home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => s,
+        },
+        None => s,
+    }
+}
+
 /// Gather the facts [`validate::target_findings`] judges, read-only. With
 /// `neighbors`, the directory's other YAML files are read too (capped), to
 /// spot plain Secrets about to be committed alongside.
@@ -266,7 +284,7 @@ pub fn scan_target(path: &Path, neighbors: bool) -> TargetScan {
         }
     }
     TargetScan {
-        path: path.display().to_string(),
+        path: pretty_path(path),
         exists: meta.is_some(),
         is_symlink: meta.as_ref().is_some_and(|m| m.file_type().is_symlink()),
         mode: meta.as_ref().filter(|m| m.is_file()).and_then(mode_of),
@@ -414,6 +432,7 @@ pub fn find_manifests(root: &Path, ns: &str, name: &str) -> Vec<Found> {
 /// unknown) nothing is, and the user chooses. Plus a note per manifest.
 pub fn choose_output(found: &[FoundManifest], given: &str, name: &str, res: &str) -> (String, Vec<Finding>) {
     let mine: Vec<&FoundManifest> = found.iter().filter(|f| f.owner == Owner::This).collect();
+    let ambiguous = given.is_empty() && mine.len() > 1;
     let out = match (given.is_empty(), mine.as_slice()) {
         (false, _) => given.to_string(),
         (true, [only]) => only.path.clone(),
@@ -445,6 +464,22 @@ pub fn choose_output(found: &[FoundManifest], given: &str, name: &str, res: &str
         })
         .collect::<Vec<_>>();
     let mut notes = notes;
+    if ambiguous {
+        let list: Vec<&str> = mine.iter().map(|f| f.path.as_str()).collect();
+        notes.push(Finding {
+            severity: Severity::Medium,
+            rule: "export.ambiguous",
+            resource: res.to_string(),
+            key: None,
+            message: format!(
+                "{} manifests of this cluster define it ({}) — none picked; exporting to {} would add one more",
+                mine.len(),
+                list.join(", "),
+                out
+            ),
+            remediation: "Ctrl+O on Output and pick the one to update (and remove the duplicate)".into(),
+        });
+    }
     // Writing elsewhere would leave two manifests for one resource (GitOps
     // tools apply both): say where this cluster's already is.
     if let [only] = mine.as_slice() {
@@ -679,7 +714,12 @@ mod tests {
         // Certificate mode (unknown): never picked; two of this cluster's: ambiguous.
         assert_eq!(choose_output(&[f("a.yaml", Owner::Unknown)], "", "db", res).0, "sealed-db.yaml");
         let two = [f("a.yaml", Owner::This), f("b.yaml", Owner::This)];
-        assert_eq!(choose_output(&two, "", "db", res).0, "sealed-db.yaml");
+        let (out, notes) = choose_output(&two, "", "db", res);
+        assert_eq!(out, "sealed-db.yaml");
+        let amb = notes.iter().find(|n| n.rule == "export.ambiguous").expect("says why none was picked");
+        assert_eq!(amb.severity, Severity::Medium);
+        assert!(amb.message.contains("a.yaml, b.yaml") && amb.message.contains("sealed-db.yaml"));
+        assert!(choose_output(&two, "a.yaml", "db", res).1.iter().all(|n| n.rule != "export.ambiguous"));
         // A path the user chose stays, with a nudge to the existing file.
         let (out, notes) = choose_output(&found, "mine.yaml", "db", res);
         assert_eq!(out, "mine.yaml");
@@ -706,6 +746,8 @@ mod tests {
         std::fs::write(p.join("notes.txt"), "kind: Secret\n").unwrap();
         let target = p.join("sealed-db.yaml");
         let s = scan_target(&target, true);
+        let shown = Path::new(&s.path);
+        assert!(s.path.ends_with("sealed-db.yaml") && (shown.is_absolute() || s.path.starts_with('~')), "{}", s.path);
         assert!(!s.exists && s.parent_exists && !s.is_symlink);
         assert_eq!(s.kustomization.as_ref().map(|k| k.0.as_str()), Some("kustomization.yaml"));
         assert_eq!(s.neighbors.iter().map(|n| n.0.as_str()).collect::<Vec<_>>(), vec!["plain.yaml"]);

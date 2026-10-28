@@ -898,7 +898,7 @@ pub fn target_findings(scan: &TargetScan, payload: &Payload) -> Vec<Finding> {
                             Severity::High,
                             "target.plaintext-neighbor",
                             res,
-                            format!("{n} in the same directory is a plain Secret with data"),
+                            format!("{} is a plain Secret with data, in the same directory", in_dir(&scan.path, n)),
                         )
                         .fix("Delete it (or move it out of the repository) so it is never committed"),
                     );
@@ -911,6 +911,14 @@ pub fn target_findings(scan: &TargetScan, payload: &Payload) -> Vec<Finding> {
     }
     sort(&mut out);
     out
+}
+
+/// `name` in the directory of `path` (shown the way `path` is).
+fn in_dir(path: &str, name: &str) -> String {
+    match path.rfind(['/', '\\']) {
+        Some(i) => format!("{}{name}", &path[..=i]),
+        None => name.to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1259,7 +1267,7 @@ mod tests {
         let ok = k("resources:\n  - ./db.yaml\n");
         let f = target_findings(&ok, &sealed_payload(Scope::Strict));
         assert_eq!(rules(&f), vec!["target.plaintext-neighbor"], "the target itself is not its own neighbour");
-        assert!(f[0].message.starts_with("plain.yaml"));
+        assert!(f[0].message.starts_with("base/plain.yaml is a plain Secret"), "{}", f[0].message);
         no_values(&f);
 
         let moved = k("namespace: staging\nnamePrefix: dev-\nresources: [other.yaml]\n");
