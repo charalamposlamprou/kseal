@@ -25,8 +25,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use crate::{cluster, core, seal};
-use app::{App, Effect, Msg, WriteError};
+use crate::validate::{self, Severity};
+use crate::{cluster, core, gitops, seal};
+use app::{App, Effect, GoPreview, Msg, Source, WriteError};
 use widgets::expand_tilde;
 
 const TICK: Duration = Duration::from_millis(50);
@@ -190,13 +191,27 @@ impl Executor<'_> {
                 let res = blocking(move || read_text(&p)).await.map_err(msg_err);
                 Msg::FileRead { tok, purpose, path, out_gen, kv_gen, res }
             }),
-            Effect::WriteFile { path, content, overwrite, what, skipped } => self.spawn(async move {
+            Effect::WriteFile { path, content, overwrite, what, skipped, confirmed } => self.spawn(async move {
                 let p = expand_tilde(&path);
                 let res = tokio::task::spawn_blocking(move || {
-                    if !overwrite && p.exists() {
-                        return Err(WriteError::Exists(content));
+                    if !confirmed {
+                        let findings = gitops::check_target(&p, &content);
+                        if findings.iter().any(|f| f.severity <= Severity::High) {
+                            return Err(WriteError::Risky { content, findings });
+                        }
                     }
-                    core::write_secret_file(&p, &content).map_err(|e| WriteError::Io(e.to_string()))
+                    match core::save_secret_file(&p, &content, overwrite) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                            // For the diff: what's there now (capped; never shown unmasked).
+                            let existing = std::fs::metadata(&p)
+                                .ok()
+                                .filter(|m| m.len() <= 1024 * 1024)
+                                .and_then(|_| std::fs::read_to_string(&p).ok());
+                            Err(WriteError::Exists { content, existing })
+                        }
+                        Err(e) => Err(WriteError::Io(e.to_string())),
+                    }
                 })
                 .await
                 .unwrap_or_else(|e| Err(WriteError::Io(e.to_string())));
@@ -218,7 +233,23 @@ impl Executor<'_> {
                 };
                 Msg::Sealed { out_gen, res: res.await.map_err(cluster_err(&ctx)) }
             }),
-            Effect::Validate { out_gen, sealed, ctx, ctl: (ns, name) } => self.spawn(async move {
+            Effect::GitopsPreview { go_gen, source, opts, ctx, cert, ctl: (ns, name), out } => self.spawn(async move {
+                let res = async {
+                    let secret_yaml = match source {
+                        Source::Yaml(y) => y,
+                        Source::File(p) => blocking(move || read_text(&p)).await?,
+                    };
+                    let pem = match cert {
+                        Some(path) => blocking(move || read_text(&path).map(String::into_bytes)).await?,
+                        None => {
+                            timed(async { cluster::fetch_cert(&kube.client(&ctx).await?, &ns, &name).await }).await?
+                        }
+                    };
+                    blocking(move || gitops_preview(&secret_yaml, &pem, &opts, &out)).await
+                };
+                Msg::GitopsPreviewed { go_gen, res: res.await.map_err(cluster_err(&ctx)) }
+            }),
+            Effect::Validate { out_gen, sealed, ctx, ctl: (ns, name), go } => self.spawn(async move {
                 let res = async {
                     let docs = core::parse_yaml_docs(&sealed)?;
                     let doc = docs
@@ -227,7 +258,7 @@ impl Executor<'_> {
                         .context("no SealedSecret in the output pane")?;
                     timed(async { cluster::verify(&kube.client(&ctx).await?, &ns, &name, doc).await }).await
                 };
-                Msg::Validated { out_gen, res: res.await.map_err(cluster_err(&ctx)) }
+                Msg::Validated { out_gen, go, res: res.await.map_err(cluster_err(&ctx)) }
             }),
             Effect::Copy { text, skipped } => {
                 if clipboard::prefer_osc52() {
@@ -258,6 +289,21 @@ impl Executor<'_> {
         }
         Ok(())
     }
+}
+
+/// Seal and check for the GitOps wizard (blocking: RSA, file reads).
+fn gitops_preview(secret_yaml: &str, pem: &[u8], opts: &gitops::Options, out: &str) -> Result<GoPreview> {
+    let (mut findings, info) = validate::cert_findings(pem, validate::now());
+    let Some(info) = info else {
+        return Ok(GoPreview { yaml: None, findings, name: String::new(), namespace: String::new(), out: out.into() });
+    };
+    let key = seal::parse_cert_pem(pem)?;
+    let export = gitops::build(secret_yaml, &key, Some(info.key), opts)?;
+    let out = if out.is_empty() { gitops::default_file_name(&export.name) } else { out.to_string() };
+    findings.extend(export.findings);
+    findings.extend(gitops::check_target(&expand_tilde(&out), &export.yaml));
+    validate::sort(&mut findings);
+    Ok(GoPreview { yaml: Some(export.yaml), findings, name: export.name, namespace: export.namespace, out })
 }
 
 fn write_osc52(term: &mut Term, text: &str) -> Result<()> {

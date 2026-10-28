@@ -12,6 +12,8 @@ use super::app::{App, Focus, Kind, Modal, PathPurpose, PickTarget, SaveWhat, Tab
 use super::widgets::{Input, centered, one_line};
 use crate::cluster::LOGIN_FAILED;
 use crate::core::EntryKind;
+use crate::diff::{self, Tag};
+use crate::validate::{self, Finding, Severity};
 
 struct Theme {
     bg: Color,
@@ -28,6 +30,8 @@ struct Theme {
     border: Color,
     row_a: Color,
     row_b: Color,
+    warn: Color,
+    note: Color,
 }
 
 /// Terminals that don't advertise truecolor get the nearest xterm-256 colour,
@@ -88,6 +92,8 @@ fn theme() -> &'static Theme {
             border: c(0x3c3c3c),
             row_a: c(0x232323),
             row_b: c(0x2a2a2a),
+            warn: c(0xce9178),
+            note: c(0xdcdcaa),
         }
     })
 }
@@ -113,6 +119,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Tab::Encode => draw_encode(f, body, app, &mut cur),
         Tab::Decode => draw_decode(f, body, app, &mut cur),
         Tab::Seal => draw_seal(f, body, app, &mut cur),
+        Tab::GitOps => draw_gitops(f, body, app, &mut cur),
     }
 
     if let Some(w) = warn {
@@ -133,7 +140,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_footer(f, footer, app);
 
     if let Some(m) = &app.modal {
-        cur = draw_modal(f, area, m);
+        let (c, h, total) = draw_modal(f, area, m);
+        cur = c;
+        if let Some((h, total)) = h.zip(total) {
+            app.view.modal_h = h;
+            app.view.modal_total = total;
+        }
     }
     if let Some(p) = cur {
         f.set_cursor_position(p);
@@ -150,8 +162,9 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(format!(" F{} {} ", i + 1, tab.title()), style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::new().bg(t.bg)), area);
-    // The context the current tab works with: the Seal tab seals with its own.
-    let ctx = if app.tab == Tab::Seal { &app.seal_ctx } else { &app.enc_ctx };
+    // The context the current tab works with: the Seal tab (and the GitOps
+    // wizard, which seals with its settings) has its own.
+    let ctx = if matches!(app.tab, Tab::Seal | Tab::GitOps) { &app.seal_ctx } else { &app.enc_ctx };
     if !ctx.is_empty() {
         let ctx = format!("⎈ {ctx} ");
         let w = (ctx.chars().count() as u16).min(area.width / 2);
@@ -502,6 +515,199 @@ fn draw_seal(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Position
     f.render_widget(Paragraph::new(text).block(blk).scroll((app.sealed_scroll.y, app.sealed_scroll.x)), out);
 }
 
+fn severity_style(s: Severity) -> Style {
+    let t = theme();
+    match s {
+        Severity::Critical => Style::new().fg(t.err).bold(),
+        Severity::High => Style::new().fg(t.err),
+        Severity::Medium => Style::new().fg(t.warn),
+        Severity::Low => Style::new().fg(t.note),
+        Severity::Info => Style::new().fg(t.dim),
+    }
+}
+
+/// Findings as lines: `SEVERITY  rule  resource [key]`, the explanation,
+/// and the fix. Messages never hold secret values; control characters are
+/// still made visible (file names and keys come from the user's files).
+fn finding_lines(findings: &[Finding]) -> Vec<Line<'static>> {
+    let t = theme();
+    let mut lines = vec![];
+    for f in findings {
+        let what = match &f.key {
+            Some(k) => format!("{} [{}]", one_line(&f.resource), one_line(k)),
+            None => one_line(&f.resource),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<8} ", f.severity.as_str()), severity_style(f.severity)),
+            Span::styled(format!("{what}  "), Style::new().fg(t.fg).bold()),
+            Span::styled(f.rule, Style::new().fg(t.dim)),
+        ]));
+        lines.push(Line::styled(format!("         {}", one_line(&f.message)), Style::new().fg(t.fg)));
+        if !f.remediation.is_empty() {
+            lines.push(Line::styled(format!("         → {}", one_line(&f.remediation)), Style::new().fg(t.accent)));
+        }
+    }
+    lines
+}
+
+/// One diff line, coloured by what happened to it.
+fn diff_line(l: &diff::Line, reveal: bool) -> Line<'static> {
+    let t = theme();
+    let text = one_line(&diff::render(l, reveal));
+    let color = match l.tag {
+        Tag::Header => t.accent,
+        Tag::Same => t.dim,
+        Tag::Added => t.ok,
+        Tag::Removed => t.err,
+        Tag::Changed => t.note,
+        Tag::Unknown => t.warn,
+        Tag::Note => t.dim,
+    };
+    let (head, rest) =
+        text.split_at(text.char_indices().nth(2 + l.field.chars().count()).map_or(text.len(), |(i, _)| i));
+    let head_style =
+        if l.tag == Tag::Header || l.tag.is_change() { Style::new().fg(color).bold() } else { Style::new().fg(color) };
+    let rest_style = if l.tag == Tag::Same { Style::new().fg(t.dim) } else { Style::new().fg(t.blue) };
+    Line::from(vec![Span::styled(head.to_string(), head_style), Span::styled(rest.to_string(), rest_style)])
+}
+
+fn draw_gitops(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Position>) {
+    let t = theme();
+    let fo = app.focus();
+    let [h1, steps, keyl, r1, r2, r3, r4, buttons, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    const W: u16 = 13;
+
+    heading(
+        f,
+        h1,
+        "GitOps export wizard",
+        Some(Line::styled("local files only — never commits, pushes or applies", Style::new().fg(t.dim))),
+    );
+
+    // ① … ⑦ with a tick for what's done.
+    let preview = app.go_preview.as_ref();
+    let has_yaml = app.go_yaml().is_some();
+    let source_ok = !app.go_source.value().trim().is_empty() || !app.yaml_out.trim().is_empty() || !app.rows.is_empty();
+    let check = match (preview, app.go_verified) {
+        (Some(p), v) if has_yaml => {
+            let s = validate::summary(&p.findings);
+            match v {
+                Some(true) => format!("{s}; controller ✓"),
+                Some(false) => format!("{s}; controller ✗"),
+                None => s,
+            }
+        }
+        _ => String::new(),
+    };
+    let steps_v = [
+        ("Source", source_ok, String::new()),
+        ("Namespace & scope", true, String::new()),
+        ("Workflow", true, String::new()),
+        ("Preview", has_yaml, String::new()),
+        ("Validate", has_yaml, check),
+        ("Output", !app.go_out.value().trim().is_empty(), String::new()),
+        ("Export", app.go_exported.is_some(), String::new()),
+    ];
+    let mut spans = vec![];
+    for (i, (name, done, extra)) in steps_v.iter().enumerate() {
+        let style = if *done { Style::new().fg(t.ok) } else { Style::new().fg(t.dim) };
+        let mark = if *done { "✓" } else { "·" };
+        let label = if extra.is_empty() {
+            format!("{} {name} {mark}", i + 1)
+        } else {
+            format!("{} {name} {mark} ({extra})", i + 1)
+        };
+        spans.push(Span::styled(label, style));
+        spans.push(Span::styled("  ›  ", Style::new().fg(t.border)));
+    }
+    spans.pop();
+    f.render_widget(Paragraph::new(Line::from(spans)), steps);
+
+    let key = if !app.cert.value().trim().is_empty() {
+        format!("the certificate {}", app.cert.value().trim())
+    } else if app.ctl_name.value().is_empty() || app.seal_ctx.is_empty() {
+        "— none yet: pick a context or a certificate on the Seal tab (F3)".into()
+    } else {
+        format!("{}/{} in {}", app.ctl_ns.value(), app.ctl_name.value(), app.seal_ctx)
+    };
+    let key_line = Line::from(vec![
+        Span::styled(format!("{:<w$} ", "Sealing key", w = W as usize), Style::new().fg(t.fg)),
+        Span::styled(format!("{key}  (from the Seal tab)"), Style::new().fg(t.dim)),
+    ]);
+    f.render_widget(Paragraph::new(key_line), keyl);
+
+    let src = Content::Input {
+        input: &app.go_source,
+        masked: false,
+        placeholder: "(the Encode tab's Secret — or Ctrl+O to pick a Secret YAML file)",
+    };
+    *cur = field(f, r1, "1 Source", W, src, fo == Focus::GoSource).or(*cur);
+    let [n, sc] = Layout::horizontal([Constraint::Fill(3), Constraint::Fill(2)]).spacing(2).areas(r2);
+    let ns = Content::Input { input: &app.go_ns, masked: false, placeholder: "(the Secret's own)" };
+    *cur = field(f, n, "2 Namespace", W, ns, fo == Focus::GoNs).or(*cur);
+    field(f, sc, "Scope", 5, Content::Picker(app.scope.as_str().into()), fo == Focus::GoScope);
+    field(f, r3, "3 Workflow", W, Content::Picker(app.workflow.title().into()), fo == Focus::GoWorkflow);
+    let out = Content::Input { input: &app.go_out, masked: false, placeholder: "(sealed-<name>.yaml)" };
+    *cur = field(f, r4, "6 Output", W, out, fo == Focus::GoOut).or(*cur);
+
+    let busy = app.go_busy;
+    let mut bspans = vec![];
+    for (label, active) in [
+        ("Ctrl+E  4 Preview & 5 check", !busy),
+        ("Ctrl+T  controller check", has_yaml && !app.validating),
+        ("Ctrl+D  diff vs output", has_yaml),
+        ("Ctrl+S  7 Export", has_yaml),
+    ] {
+        let style = if active { Style::new().bg(t.field_focus).fg(t.fg) } else { Style::new().bg(t.bg3).fg(t.dim) };
+        bspans.push(Span::styled(format!(" {label} "), style));
+        bspans.push(Span::raw("  "));
+    }
+    if busy {
+        bspans.push(Span::styled("sealing and checking…", Style::new().fg(t.dim)));
+    }
+    f.render_widget(Paragraph::new(Line::from(bspans)), buttons);
+
+    let [pv, fd] = Layout::horizontal([Constraint::Fill(3), Constraint::Fill(2)]).spacing(1).areas(body);
+    let blk = pane_block("SealedSecret preview", "Ctrl+Y copy", fo == Focus::GoPreview);
+    app.view.go_h = blk.inner(pv).height;
+    let text = match app.go_yaml() {
+        Some(y) => Text::styled(y.to_string(), Style::new().fg(t.blue)),
+        None => Text::styled(
+            "Ctrl+E seals the source for the namespace, scope and workflow above and checks the result",
+            Style::new().fg(t.dim),
+        ),
+    };
+    f.render_widget(Paragraph::new(text).block(blk).scroll((app.go_scroll.y, app.go_scroll.x)), pv);
+
+    let title = match preview {
+        Some(p) => format!("Findings — {}", validate::summary(&p.findings)),
+        None => "Findings".into(),
+    };
+    let blk = pane_block(&title, "↑↓ scroll", fo == Focus::GoFindings);
+    let inner = blk.inner(fd);
+    app.view.findings_h = inner.height;
+    let lines = preview.map(|p| finding_lines(&p.findings)).unwrap_or_default();
+    let para = if lines.is_empty() {
+        Paragraph::new(Line::styled("Validation results appear here, most severe first", Style::new().fg(t.dim)))
+    } else {
+        Paragraph::new(lines)
+    }
+    .wrap(Wrap { trim: false });
+    app.view.findings_total = para.line_count(inner.width) as u16;
+    f.render_widget(para.block(blk).scroll((app.go_find_scroll, 0)), fd);
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let t = theme();
     let hints = match app.modal {
@@ -509,6 +715,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Some(Modal::Path { .. }) => "Tab complete · Enter OK · Esc cancel",
         Some(Modal::RowEdit { .. }) => "Tab key/value · Enter save · Ctrl+X show · Esc cancel",
         Some(Modal::Overwrite { .. }) => "y overwrite · any other key cancels",
+        Some(Modal::Diff { confirm: Some(_), .. }) => {
+            "y overwrite · Esc cancel · ↑↓ PgUp PgDn scroll · n/N next/prev change · Ctrl+X reveal values"
+        }
+        Some(Modal::Diff { .. }) => "↑↓ PgUp PgDn scroll · n/N next/prev change · Ctrl+X reveal values · Esc close",
+        Some(Modal::Findings { confirm: Some(_), .. }) => "y write anyway · Esc cancel · ↑↓ scroll",
+        Some(Modal::Findings { .. }) => "↑↓ scroll · Esc close",
         Some(Modal::Help) => "any key closes",
         Some(Modal::Error { ref detail, .. }) if detail.starts_with(LOGIN_FAILED) => {
             "Ctrl+R retry · Ctrl+Y copy the error · any other key closes"
@@ -530,9 +742,16 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Focus::SecName | Focus::SecNs => "Ctrl+G generate · Ctrl+O open file · Ctrl+L load",
             Focus::CtlName | Focus::CtlNs => "edit to override detection · Ctrl+K clear",
             Focus::Cert => "Ctrl+O pick a cert · Ctrl+K clear",
+            Focus::GoSource => "Ctrl+O pick a Secret YAML · empty = the Encode tab's Secret · Ctrl+E preview",
+            Focus::GoNs => "seal for this namespace · empty = the Secret's own · Ctrl+E preview",
+            Focus::GoScope | Focus::GoWorkflow => "Enter pick · Ctrl+E preview",
+            Focus::GoOut => "the file to write (0600) · Ctrl+S export · Ctrl+D diff against it",
+            Focus::GoPreview | Focus::GoFindings => {
+                "↑↓ scroll · Ctrl+E preview · Ctrl+T controller · Ctrl+D diff · Ctrl+S export"
+            }
         },
     };
-    let right = "↑↓←→ move · F1-F3 tabs · ? help · Ctrl+Q quit ";
+    let right = "↑↓←→ move · F1-F4 tabs · ? help · Ctrl+Q quit ";
     let [l, r] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right.chars().count() as u16)]).areas(area);
     f.render_widget(Paragraph::new(format!(" {hints}")).style(Style::new().bg(t.bg3).fg(t.dim)), l);
@@ -548,7 +767,49 @@ fn modal_block(title: &str) -> Block<'_> {
         .style(Style::new().bg(t.bg2).fg(t.fg))
 }
 
-fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
+/// Draws a modal. Returns the cursor, and for scrollable modals the page
+/// height and total line count.
+fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> (Option<Position>, Option<u16>, Option<u16>) {
+    let t = theme();
+    match m {
+        Modal::Diff { title, diff, scroll, reveal, .. } => {
+            let r = area.inner(Margin { horizontal: 2, vertical: 1 });
+            f.render_widget(Clear, r);
+            let mut title = format!("{title} — {}", diff.summary);
+            if *reveal {
+                title.push_str(" — VALUES REVEALED");
+            }
+            let blk = modal_block(&title);
+            let blk = if *reveal { blk.border_style(Style::new().fg(t.err)) } else { blk };
+            let inner = blk.inner(r);
+            let lines: Vec<Line> = diff.lines.iter().map(|l| diff_line(l, *reveal)).collect();
+            f.render_widget(Paragraph::new(lines).block(blk).scroll((*scroll, 0)), r);
+            (None, Some(inner.height), Some(diff.lines.len() as u16))
+        }
+        Modal::Findings { title, findings, scroll, confirm } => {
+            let r = area.inner(Margin { horizontal: 4, vertical: 2 });
+            f.render_widget(Clear, r);
+            let title = format!("{title} — {}", validate::summary(findings));
+            let blk = modal_block(&title).border_style(Style::new().fg(t.err));
+            let inner = blk.inner(r);
+            f.render_widget(blk, r);
+            let [body, hint] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+            let para = Paragraph::new(finding_lines(findings)).wrap(Wrap { trim: false });
+            let total = para.line_count(body.width) as u16;
+            f.render_widget(para.scroll((*scroll, 0)), body);
+            let h = if confirm.is_some() {
+                "y write anyway · Esc cancel"
+            } else {
+                "Not written — fix the Critical finding(s) · Esc close"
+            };
+            f.render_widget(Paragraph::new(h).style(Style::new().fg(t.accent)), hint);
+            (None, Some(body.height), Some(total))
+        }
+        _ => (draw_simple_modal(f, area, m), None, None),
+    }
+}
+
+fn draw_simple_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
     let t = theme();
     match m {
         Modal::Picker { target, picker } => {
@@ -587,6 +848,9 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 PathPurpose::Open(Tab::Encode) => "Open .env or Secret YAML",
                 PathPurpose::Open(Tab::Decode) => "Open Secret YAML",
                 PathPurpose::Open(Tab::Seal) => "Sealing certificate (PEM)",
+                PathPurpose::Open(Tab::GitOps) => "Secret YAML to export",
+                PathPurpose::Diff(_) => "Compare with a local Secret / SealedSecret manifest",
+                PathPurpose::Save(SaveWhat::Export) => "Export SealedSecret as (written 0600)",
                 PathPurpose::Save(SaveWhat::Yaml) => "Save Secret YAML as (written 0600)",
                 PathPurpose::Save(SaveWhat::Sealed) => "Save SealedSecret as (written 0600)",
             };
@@ -653,6 +917,7 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
             f.render_widget(para, inner);
             None
         }
+        Modal::Diff { .. } | Modal::Findings { .. } => None,
         Modal::Help => {
             let k = |key: &'static str, what: &'static str| {
                 Line::from(vec![Span::styled(format!("{key:<16}"), Style::new().fg(t.accent)), Span::raw(what)])
@@ -662,11 +927,12 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 h("Anywhere"),
                 k("↑ ↓ ← →", "move between fields (tables, panes and text first)"),
                 k("Tab / Shift-Tab", "next / previous field"),
-                k("F1 F2 F3", "Encode / Decode / Seal  (also Ctrl+N / Ctrl+P)"),
+                k("F1 … F4", "Encode / Decode / Seal / GitOps  (also Ctrl+N / Ctrl+P)"),
                 k("Ctrl+G", "generate Secret YAML from the rows"),
                 k("Ctrl+O", "open file: .env or Secret YAML (Seal tab: certificate)"),
                 k("Ctrl+L", "load the selected Secret from the cluster (read-only)"),
-                k("Ctrl+E / Ctrl+T", "seal / validate with the controller"),
+                k("Ctrl+E / Ctrl+T", "seal / validate with the controller (GitOps: preview / check)"),
+                k("Ctrl+D", "diff the output against a local Secret / SealedSecret file"),
                 k("Ctrl+Y", "copy whatever is focused"),
                 k("Ctrl+S", "save the YAML / SealedSecret (0600)"),
                 k("Ctrl+K", "clear the focused thing"),
@@ -684,6 +950,11 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 h("Pickers and panes"),
                 k("Enter", "open a picker (type to filter)"),
                 k("↑↓ ←→", "scroll a YAML pane"),
+                Line::raw(""),
+                h("Diff viewer"),
+                k("n / N", "next / previous change"),
+                k("Ctrl+X", "reveal values (masked by default)"),
+                k("y / Esc", "overwrite / cancel, when it asks"),
                 Line::raw(""),
                 Line::styled(
                     "kseal only reads from the cluster: it never creates, patches or deletes anything.",
@@ -750,6 +1021,37 @@ mod tests {
         app.modal = Some(Modal::Error { title: "Load failed".into(), detail: "\x1b[31mred\x07".into() });
         let s = render(&mut app, 120, 40);
         assert!(s.contains("�[31mred�") && !s.contains('\x1b'));
+    }
+
+    #[test]
+    fn gitops_tab_and_diff_popup_render_and_mask() {
+        use crate::diff::diff_texts;
+        let mut app = App::new();
+        app.tab = Tab::GitOps;
+        for (w, h) in [(160, 45), (60, 20), (20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+        let s = render(&mut app, 160, 45);
+        assert!(s.contains("GitOps export wizard") && s.contains("1 Source") && s.contains("7 Export"));
+        assert!(s.contains("F4 GitOps"));
+
+        let old = "kind: Secret\nmetadata: {name: db, namespace: prod}\nstringData: {P: dummy-one}\n";
+        let new = "kind: Secret\nmetadata: {name: db, namespace: prod}\nstringData: {P: dummy-two}\n";
+        let d = diff_texts(old, new).unwrap();
+        app.modal = Some(Modal::Diff { title: "t".into(), diff: d.clone(), scroll: 0, reveal: false, confirm: None });
+        for (w, h) in [(60, 20), (20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+        let s = render(&mut app, 160, 45);
+        assert!(s.contains("~ data.P") && !s.contains("dummy-one") && !s.contains("dummy-two"), "{s}");
+        app.modal = Some(Modal::Diff { title: "t".into(), diff: d, scroll: 0, reveal: true, confirm: None });
+        let s = render(&mut app, 160, 45);
+        assert!(s.contains("dummy-one") && s.contains("VALUES REVEALED"));
+
+        let f = crate::validate::secret_findings(&serde_json::json!({"kind": "Secret", "data": {"P": "dummy-plain"}}));
+        app.modal = Some(Modal::Findings { title: "Before writing x".into(), findings: f, scroll: 0, confirm: None });
+        let s = render(&mut app, 160, 45);
+        assert!(s.contains("HIGH") && s.contains("secret.invalid-base64") && !s.contains("dummy-plain"));
     }
 
     #[test]

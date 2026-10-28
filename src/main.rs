@@ -5,8 +5,11 @@
 
 mod cluster;
 mod core;
+mod diff;
+mod gitops;
 mod seal;
 mod tui;
+mod validate;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -15,7 +18,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::core::EntryKind;
+use crate::gitops::Workflow;
 use crate::seal::Scope;
+use crate::validate::Severity;
 
 #[derive(Parser)]
 #[command(name = "kseal", version, about, long_about = None)]
@@ -94,6 +99,64 @@ enum Cmd {
         #[command(flatten)]
         ctl: ControllerArgs,
     },
+    /// Compare two Secret / SealedSecret manifests by meaning: keys added,
+    /// removed or modified, labels, annotations, type and scope. Values are
+    /// masked unless --reveal.
+    Diff {
+        /// The old manifest ("-" for stdin).
+        old: String,
+        /// The new manifest ("-" for stdin).
+        new: String,
+        /// Show decoded values of plain Secrets (encrypted values never are).
+        #[arg(long)]
+        reveal: bool,
+        /// Exit with status 1 when the manifests differ.
+        #[arg(long)]
+        exit_code: bool,
+    },
+    /// Check Secret / SealedSecret manifests and sealing certificates for
+    /// security problems, offline. SealedSecret checks are structural:
+    /// `kseal validate` asks the controller whether it can decrypt.
+    Lint {
+        /// Manifest to check ("-" for stdin; multi-document files work).
+        #[arg(short = 'f', long, required_unless_present = "cert")]
+        file: Option<String>,
+        /// Sealing certificate to check (and to check the SealedSecrets against).
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        /// Exit with status 1 when a finding is at least this severe.
+        #[arg(long, value_enum, default_value = "high")]
+        fail_on: Severity,
+    },
+    /// Seal a Secret for a GitOps repository (Argo CD, Flux) and write it to
+    /// a local file after safety checks. Never commits, pushes or applies.
+    Export {
+        #[arg(short = 'f', long, default_value = "-")]
+        file: String,
+        #[arg(long, value_enum, default_value = "generic")]
+        workflow: Workflow,
+        #[arg(long, value_enum, default_value = "strict")]
+        scope: Scope,
+        /// Seal for this namespace instead of the Secret's own.
+        #[arg(short = 'n', long)]
+        namespace: Option<String>,
+        /// Seal offline with this certificate instead of fetching it from the controller.
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        #[command(flatten)]
+        kube: KubeArgs,
+        #[command(flatten)]
+        ctl: ControllerArgs,
+        /// File to write (owner-only permissions).
+        #[arg(short = 'o', long)]
+        output: PathBuf,
+        /// Replace the file if it exists (shows what changes first).
+        #[arg(long)]
+        force: bool,
+        /// Write nothing when a finding is at least this severe.
+        #[arg(long, value_enum, default_value = "critical")]
+        fail_on: Severity,
+    },
 }
 
 #[derive(Args, Clone)]
@@ -167,6 +230,24 @@ async fn controller(client: &kube::Client, ctl: &ControllerArgs) -> Result<(Stri
             Ok((ctl.controller_namespace.clone().unwrap_or(ns), ctl.controller_name.clone().unwrap_or(name)))
         }
         None => bail!("no sealed-secrets controller found — pass --controller-name/--controller-namespace or --cert"),
+    }
+}
+
+fn print_findings(findings: &[validate::Finding]) {
+    for f in findings {
+        eprintln!("{}", validate::format_finding(f));
+    }
+}
+
+/// The sealing certificate: `--cert`, or the controller's (read-only fetch).
+async fn sealing_cert(cert: Option<PathBuf>, kube: &KubeArgs, ctl: &ControllerArgs) -> Result<Vec<u8>> {
+    match cert {
+        Some(p) => std::fs::read(&p).with_context(|| format!("reading {}", p.display())),
+        None => {
+            let (client, _) = cluster::client_for(kube.context.as_deref(), true).await?;
+            let (ns, name) = controller(&client, ctl).await?;
+            cluster::fetch_cert(&client, &ns, &name).await
+        }
     }
 }
 
@@ -279,8 +360,94 @@ async fn run(cmd: Cmd) -> Result<()> {
             let (ns, name) = controller(&client, &ctl).await?;
             std::io::stdout().write_all(&cluster::fetch_cert(&client, &ns, &name).await?)?;
         }
+        Cmd::Diff { old, new, reveal, exit_code } => {
+            if old == "-" && new == "-" {
+                bail!("only one side can be read from stdin");
+            }
+            let d = diff::diff_texts(&read_input(&old)?, &read_input(&new)?)?;
+            let mut out = std::io::stdout().lock();
+            for l in &d.lines {
+                writeln!(out, "{}", widgets_free_line(&diff::render(l, reveal)))?;
+            }
+            eprintln!("{}", d.summary);
+            if exit_code && !d.summary.is_identical() {
+                out.flush()?;
+                std::process::exit(1);
+            }
+        }
+        Cmd::Lint { file, cert, fail_on } => {
+            let mut findings = vec![];
+            let mut key = None;
+            if let Some(p) = cert {
+                let pem = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+                let (f, info) = validate::cert_findings(&pem, validate::now());
+                findings.extend(f);
+                key = info.map(|i| i.key);
+            }
+            if let Some(file) = file {
+                let docs = core::parse_yaml_docs(&read_input(&file)?).context("malformed YAML")?;
+                findings.extend(validate::file_findings(&docs, key));
+            }
+            validate::sort(&mut findings);
+            print_findings(&findings);
+            eprintln!("{}", validate::summary(&findings));
+            let failing = findings.iter().filter(|f| f.severity <= fail_on).count();
+            if failing > 0 {
+                bail!("{failing} finding(s) at or above {}", fail_on.as_str().to_lowercase());
+            }
+        }
+        Cmd::Export { file, workflow, scope, namespace, cert, kube, ctl, output, force, fail_on } => {
+            let input = read_input(&file)?;
+            let pem = sealing_cert(cert, &kube, &ctl).await?;
+            let (mut findings, info) = validate::cert_findings(&pem, validate::now());
+            let Some(info) = info else {
+                print_findings(&findings);
+                bail!("the sealing certificate can't be used — nothing written");
+            };
+            let key = seal::parse_cert_pem(&pem)?;
+            let opts = gitops::Options { workflow, scope, namespace };
+            let export = gitops::build(&input, &key, Some(info.key), &opts)?;
+            findings.extend(export.findings);
+            findings.extend(gitops::check_target(&output, &export.yaml));
+            validate::sort(&mut findings);
+            print_findings(&findings);
+            let failing = findings.iter().filter(|f| f.severity <= fail_on).count();
+            if failing > 0 {
+                bail!("{failing} finding(s) at or above {} — nothing written", fail_on.as_str().to_lowercase());
+            }
+            if output.exists() && force {
+                if let Ok(old) = std::fs::read_to_string(&output) {
+                    if let Ok(d) = diff::diff_texts(&old, &export.yaml) {
+                        eprintln!("replacing {}: {}", output.display(), d.summary);
+                    }
+                }
+            }
+            match core::save_secret_file(&output, &export.yaml, force) {
+                Ok(()) => {
+                    eprintln!("wrote {} ({} workflow, {} scope)", output.display(), workflow.title(), scope.as_str())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Ok(d) = std::fs::read_to_string(&output)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|old| diff::diff_texts(&old, &export.yaml))
+                    {
+                        for l in d.lines.iter().filter(|l| l.tag.is_change() || l.tag == diff::Tag::Header) {
+                            eprintln!("{}", widgets_free_line(&diff::render(l, false)));
+                        }
+                        eprintln!("{}", d.summary);
+                    }
+                    bail!("{} exists — pass --force to replace it", output.display());
+                }
+                Err(e) => return Err(anyhow::Error::from(e).context(format!("writing {}", output.display()))),
+            }
+        }
     }
     Ok(())
+}
+
+/// Control characters made visible, so a manifest can't drive the terminal.
+fn widgets_free_line(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
 }
 
 fn main() -> Result<()> {
@@ -292,6 +459,7 @@ fn main() -> Result<()> {
             let context = match &cmd {
                 Cmd::Get { kube, .. }
                 | Cmd::Seal { kube, .. }
+                | Cmd::Export { kube, .. }
                 | Cmd::Validate { kube, .. }
                 | Cmd::Cert { kube, .. } => kube.context.clone(),
                 _ => None,

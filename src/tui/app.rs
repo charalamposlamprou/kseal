@@ -20,6 +20,16 @@
 //!   controller", distinct from absent ("never looked up"). Ctrl+R clears it
 //!   and bumps `ctl_refresh_gen`; a successful lookup dispatched before the
 //!   refresh is discarded and re-run rather than shown or cached.
+//! * `go_gen` — bumped whenever what the GitOps preview describes changes
+//!   (its source, namespace, scope, workflow, or the Encode tab's outputs).
+//!   Previews and controller checks dispatched before are discarded.
+//!
+//! ## Writes
+//!
+//! Every save goes through the same gate: the target is checked first
+//! (symlink, permissions, plaintext next to a SealedSecret, Kustomize
+//! namespace/name rewrites…) and anything High or worse asks first; an
+//! existing file is never replaced without showing what changes.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -31,7 +41,10 @@ use serde_json::Value;
 use super::widgets::{Input, Picker, complete_path};
 use crate::cluster::Contexts;
 use crate::core::{self, Carryover, Entry, EntryKind, FileKind, Pairs};
+use crate::diff;
+use crate::gitops::{self, Workflow};
 use crate::seal::Scope;
+use crate::validate::{Finding, Severity};
 
 pub const STATUS_DURATION: Duration = Duration::from_millis(4000);
 /// Lossy-result statuses (metadata skipped / binary dropped) linger longer
@@ -45,15 +58,17 @@ pub enum Tab {
     Encode,
     Decode,
     Seal,
+    GitOps,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Encode, Tab::Decode, Tab::Seal];
+    pub const ALL: [Tab; 4] = [Tab::Encode, Tab::Decode, Tab::Seal, Tab::GitOps];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Encode => "Encode",
             Tab::Decode => "Decode",
             Tab::Seal => "Seal",
+            Tab::GitOps => "GitOps",
         }
     }
     fn idx(self) -> usize {
@@ -85,6 +100,14 @@ pub enum Focus {
     CtlNs,
     Cert,
     Sealed,
+    // GitOps
+    GoSource,
+    GoNs,
+    GoScope,
+    GoWorkflow,
+    GoOut,
+    GoPreview,
+    GoFindings,
 }
 
 impl Focus {
@@ -94,6 +117,7 @@ impl Focus {
             Tab::Encode => &[SvIn, SvOut, EncCtx, EncNs, EncSecret, Rows, SecName, SecNs, SecType, Yaml],
             Tab::Decode => &[DvIn, DvOut, DecRows],
             Tab::Seal => &[SealCtx, Scope, CtlName, CtlNs, Cert, Sealed],
+            Tab::GitOps => &[GoSource, GoNs, GoScope, GoWorkflow, GoOut, GoPreview, GoFindings],
         }
     }
     /// The tab's fields as laid out on screen, row by row: what the arrow
@@ -106,12 +130,13 @@ impl Focus {
             }
             Tab::Decode => &[&[DvIn], &[DvOut], &[DecRows]],
             Tab::Seal => &[&[SealCtx, Scope], &[CtlName, CtlNs], &[Cert], &[Sealed]],
+            Tab::GitOps => &[&[GoSource], &[GoNs, GoScope], &[GoWorkflow], &[GoOut], &[GoPreview, GoFindings]],
         }
     }
     /// Fields that take typed text (so `?` and letters are input, not keys).
     pub fn is_text(self) -> bool {
         use Focus::*;
-        matches!(self, SvIn | DvIn | SecName | SecNs | CtlName | CtlNs | Cert)
+        matches!(self, SvIn | DvIn | SecName | SecNs | CtlName | CtlNs | Cert | GoSource | GoNs | GoOut)
     }
 }
 
@@ -192,36 +217,112 @@ pub enum PickTarget {
     SecType,
     SealCtx,
     Scope,
+    Workflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathPurpose {
     /// Encode: .env or Secret YAML into the editor; Decode: Secret YAML into
-    /// the table; Seal: the offline certificate.
+    /// the table; Seal: the offline certificate; GitOps: the source Secret.
     Open(Tab),
     Save(SaveWhat),
+    /// A local manifest to compare the current output with.
+    Diff(SaveWhat),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveWhat {
     Yaml,
     Sealed,
+    /// The GitOps wizard's SealedSecret.
+    Export,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadPurpose {
     Editor,
     Decode,
+    Diff(SaveWhat),
+}
+
+/// A write waiting for the user's go-ahead (risky target, or overwrite).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingWrite {
+    pub path: String,
+    pub content: String,
+    pub what: SaveWhat,
+    pub skipped: usize,
+    /// The target checks were shown and accepted.
+    pub confirmed: bool,
+}
+
+/// What the wizard seals with: a certificate file (if set), the controller
+/// `(ns, name)`, and how to describe it.
+type SealingKey = (Option<String>, (String, String), SealedWith);
+
+/// Where the GitOps wizard's Secret comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    /// The Encode tab's generated YAML.
+    Yaml(String),
+    File(String),
+}
+
+/// A GitOps preview: the SealedSecret to export (absent when the
+/// certificate was unusable) and everything validation found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoPreview {
+    pub yaml: Option<String>,
+    pub findings: Vec<Finding>,
+    pub name: String,
+    pub namespace: String,
+    /// The output path the target checks ran for.
+    pub out: String,
 }
 
 #[derive(Debug)]
 pub enum Modal {
-    Picker { target: PickTarget, picker: Picker },
-    Path { purpose: PathPurpose, input: Input },
-    RowEdit { idx: Option<usize>, key: Input, value: Input, on_value: bool, shown: bool },
-    Overwrite { path: String, content: String, what: SaveWhat, skipped: usize },
+    Picker {
+        target: PickTarget,
+        picker: Picker,
+    },
+    Path {
+        purpose: PathPurpose,
+        input: Input,
+    },
+    RowEdit {
+        idx: Option<usize>,
+        key: Input,
+        value: Input,
+        on_value: bool,
+        shown: bool,
+    },
+    Overwrite {
+        path: String,
+        content: String,
+        what: SaveWhat,
+        skipped: usize,
+    },
+    /// A semantic diff; with `confirm`, `y` performs that (over)write.
+    Diff {
+        title: String,
+        diff: diff::Diff,
+        scroll: u16,
+        reveal: bool,
+        confirm: Option<PendingWrite>,
+    },
+    /// Validation findings; with `confirm`, `y` writes anyway.
+    Findings {
+        title: String,
+        findings: Vec<Finding>,
+        scroll: u16,
+        confirm: Option<PendingWrite>,
+    },
     Help,
-    Error { title: String, detail: String },
+    Error {
+        title: String,
+        detail: String,
+    },
 }
 
 /// Side effects for the event loop to run. Results come back as [`Msg`]s.
@@ -259,12 +360,15 @@ pub enum Effect {
         out_gen: u64,
         kv_gen: u64,
     },
+    /// Check the target (unless `confirmed`), then write it — exclusively
+    /// unless `overwrite`.
     WriteFile {
         path: String,
         content: String,
         overwrite: bool,
         what: SaveWhat,
         skipped: usize,
+        confirmed: bool,
     },
     Seal {
         out_gen: u64,
@@ -279,6 +383,18 @@ pub enum Effect {
         sealed: String,
         ctx: String,
         ctl: (String, String),
+        /// `Some(go_gen)`: the GitOps preview is being checked.
+        go: Option<u64>,
+    },
+    /// Seal for the GitOps wizard and validate the result.
+    GitopsPreview {
+        go_gen: u64,
+        source: Source,
+        opts: gitops::Options,
+        ctx: String,
+        cert: Option<String>,
+        ctl: (String, String),
+        out: String,
     },
     Copy {
         text: String,
@@ -300,7 +416,17 @@ pub enum Effect {
 
 #[derive(Debug)]
 pub enum WriteError {
-    Exists(String),
+    /// The file exists: the content to write, and what is there now (when
+    /// it could be read) for the diff.
+    Exists {
+        content: String,
+        existing: Option<String>,
+    },
+    /// The target checks found something High or worse.
+    Risky {
+        content: String,
+        findings: Vec<Finding>,
+    },
     Io(String),
 }
 
@@ -357,7 +483,12 @@ pub enum Msg {
     },
     Validated {
         out_gen: u64,
+        go: Option<u64>,
         res: Result<bool, String>,
+    },
+    GitopsPreviewed {
+        go_gen: u64,
+        res: Result<GoPreview, String>,
     },
     /// `Ok(how)` names the mechanism used; `Err` hands the text back so the
     /// app can fall back to OSC 52.
@@ -381,6 +512,12 @@ pub struct View {
     pub dec_h: u16,
     pub yaml_h: u16,
     pub sealed_h: u16,
+    pub go_h: u16,
+    pub findings_h: u16,
+    /// Wrapped line counts of the findings pane / popup, from the last draw.
+    pub findings_total: u16,
+    pub modal_h: u16,
+    pub modal_total: u16,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -391,10 +528,10 @@ pub struct Scroll {
 
 pub struct App {
     pub tab: Tab,
-    focus: [Focus; 3],
+    focus: [Focus; 4],
     /// Per tab, the column ↑/↓ aim for, so moving down through a one-field
     /// row and back up returns to where you came from.
-    want_col: [usize; 3],
+    want_col: [usize; 4],
     pub modal: Option<Modal>,
     pub status: Status,
     pub quit: bool,
@@ -472,6 +609,24 @@ pub struct App {
     ctl_cache: HashMap<String, Option<(String, String)>>,
     ctl_refresh_gen: u64,
 
+    // GitOps wizard
+    /// Optional Secret YAML file; empty = the Encode tab's YAML.
+    pub go_source: Input,
+    /// Target namespace; empty = the Secret's own.
+    pub go_ns: Input,
+    pub workflow: Workflow,
+    pub go_out: Input,
+    pub go_preview: Option<GoPreview>,
+    pub go_busy: bool,
+    pub go_scroll: Scroll,
+    pub go_find_scroll: u16,
+    /// What the preview was sealed with (from the Seal tab's settings).
+    pub go_with: Option<SealedWith>,
+    /// The controller's verdict on the current preview, once asked.
+    pub go_verified: Option<bool>,
+    pub go_exported: Option<String>,
+    go_gen: u64,
+
     out_gen: u64,
     kv_edit_gen: u64,
 }
@@ -486,8 +641,8 @@ impl App {
     pub fn new() -> Self {
         Self {
             tab: Tab::Encode,
-            focus: [Focus::SvIn, Focus::DvIn, Focus::SealCtx],
-            want_col: [0; 3],
+            focus: [Focus::SvIn, Focus::DvIn, Focus::SealCtx, Focus::GoSource],
+            want_col: [0; 4],
             modal: None,
             status: Status::ready(),
             quit: false,
@@ -539,6 +694,18 @@ impl App {
             ctl_pending: None,
             ctl_cache: HashMap::new(),
             ctl_refresh_gen: 0,
+            go_source: Input::default(),
+            go_ns: Input::default(),
+            workflow: Workflow::default(),
+            go_out: Input::default(),
+            go_preview: None,
+            go_busy: false,
+            go_scroll: Scroll::default(),
+            go_find_scroll: 0,
+            go_with: None,
+            go_verified: None,
+            go_exported: None,
+            go_gen: 0,
             out_gen: 0,
             kv_edit_gen: 0,
         }
@@ -667,6 +834,21 @@ impl App {
         self.sealed_out.clear();
         self.yaml_scroll = Scroll::default();
         self.sealed_scroll = Scroll::default();
+        if self.go_source.value().trim().is_empty() {
+            self.go_changed();
+        }
+    }
+
+    /// What the GitOps preview describes changed: drop it (and its verdict),
+    /// so in-flight previews and checks land stale.
+    fn go_changed(&mut self) {
+        self.go_gen += 1;
+        self.go_preview = None;
+        self.go_verified = None;
+        self.go_exported = None;
+        self.go_with = None;
+        self.go_scroll = Scroll::default();
+        self.go_find_scroll = 0;
     }
 
     /// A row was added, removed or really edited.
@@ -799,13 +981,13 @@ impl App {
             return;
         }
         match k.code {
-            KeyCode::F(n @ 1..=3) => self.tab = Tab::ALL[n as usize - 1],
+            KeyCode::F(n @ 1..=4) => self.tab = Tab::ALL[n as usize - 1],
             KeyCode::Tab => self.cycle_focus(1),
             KeyCode::BackTab => self.cycle_focus(-1),
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right if !ctrl => self.arrow(k),
             KeyCode::Char(c) if ctrl => match c {
-                'n' => self.tab = Tab::ALL[(self.tab.idx() + 1) % 3],
-                'p' => self.tab = Tab::ALL[(self.tab.idx() + 2) % 3],
+                'n' => self.tab = Tab::ALL[(self.tab.idx() + 1) % Tab::ALL.len()],
+                'p' => self.tab = Tab::ALL[(self.tab.idx() + Tab::ALL.len() - 1) % Tab::ALL.len()],
                 'g' => {
                     self.generate();
                 }
@@ -815,8 +997,11 @@ impl App {
                 's' => self.save_prompt(),
                 'k' => self.clear_focused(),
                 'r' => self.refresh_contexts(),
+                'e' if self.tab == Tab::GitOps => self.gitops_preview(),
                 'e' => self.do_seal(),
+                't' if self.tab == Tab::GitOps => self.gitops_validate(),
                 't' => self.do_validate(),
+                'd' => self.diff_prompt(),
                 'x' => self.toggle_show(),
                 _ => self.field_key(k),
             },
@@ -842,6 +1027,14 @@ impl App {
             Focus::DecRows if vertical => list_nav(&mut self.dec_state, k, self.dec_rows.len(), self.view.dec_h),
             Focus::Yaml => scroll_key(&mut self.yaml_scroll, k, self.view.yaml_h, &self.yaml_out),
             Focus::Sealed => scroll_key(&mut self.sealed_scroll, k, self.view.sealed_h, &self.sealed_out),
+            Focus::GoPreview => {
+                let text = self.go_preview.as_ref().and_then(|p| p.yaml.as_deref()).unwrap_or("");
+                scroll_key(&mut self.go_scroll, k, self.view.go_h, text)
+            }
+            Focus::GoFindings if vertical => {
+                let n = self.findings_lines();
+                line_scroll(&mut self.go_find_scroll, k, self.view.findings_h, n)
+            }
             _ if f.is_text() && !vertical => {
                 let input = self.text_input(f);
                 let at_edge = if d < 0 { input.at_start() } else { input.at_end() };
@@ -869,8 +1062,16 @@ impl App {
             Focus::SecNs => &mut self.sec_ns,
             Focus::CtlName => &mut self.ctl_name,
             Focus::CtlNs => &mut self.ctl_ns,
+            Focus::GoSource => &mut self.go_source,
+            Focus::GoNs => &mut self.go_ns,
+            Focus::GoOut => &mut self.go_out,
             _ => &mut self.cert,
         }
+    }
+
+    /// Lines the findings pane renders (for scrolling).
+    pub fn findings_lines(&self) -> usize {
+        self.view.findings_total as usize
     }
 
     fn field_key(&mut self, k: KeyEvent) {
@@ -894,6 +1095,30 @@ impl App {
             }
             Focus::Cert => {
                 self.cert.handle(k);
+            }
+            Focus::GoSource | Focus::GoNs => {
+                let input = if f == Focus::GoSource { &mut self.go_source } else { &mut self.go_ns };
+                if input.handle(k) {
+                    self.go_changed();
+                }
+            }
+            Focus::GoOut => {
+                if self.go_out.handle(k) {
+                    self.go_out_edited();
+                }
+            }
+            Focus::GoScope | Focus::GoWorkflow => {
+                if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    self.open_picker(f);
+                }
+            }
+            Focus::GoPreview => {
+                let text = self.go_preview.as_ref().and_then(|p| p.yaml.as_deref()).unwrap_or("");
+                scroll_key(&mut self.go_scroll, k, self.view.go_h, text);
+            }
+            Focus::GoFindings => {
+                let n = self.findings_lines();
+                line_scroll(&mut self.go_find_scroll, k, self.view.findings_h, n);
             }
             Focus::CtlName | Focus::CtlNs => {
                 let input = if f == Focus::CtlName { &mut self.ctl_name } else { &mut self.ctl_ns };
@@ -1030,7 +1255,7 @@ impl App {
             _ => match self.tab {
                 Tab::Encode => self.rows_show_all(),
                 Tab::Decode => self.dec_show_all(),
-                Tab::Seal => {}
+                Tab::Seal | Tab::GitOps => {}
             },
         }
     }
@@ -1067,6 +1292,15 @@ impl App {
                 Focus::CtlNs => {
                     self.ctl_ns.insert_str(&line);
                     self.controller_edited();
+                }
+                Focus::GoSource | Focus::GoNs => {
+                    let input = if self.focus() == Focus::GoSource { &mut self.go_source } else { &mut self.go_ns };
+                    input.insert_str(&line);
+                    self.go_changed();
+                }
+                Focus::GoOut => {
+                    self.go_out.insert_str(&line);
+                    self.go_out_edited();
                 }
                 _ => {}
             },
@@ -1143,10 +1377,92 @@ impl App {
             }
             Modal::Overwrite { path, content, what, skipped } => {
                 if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                    self.effects.push(Effect::WriteFile { path, content, overwrite: true, what, skipped });
+                    self.effects.push(Effect::WriteFile {
+                        path,
+                        content,
+                        overwrite: true,
+                        what,
+                        skipped,
+                        confirmed: true,
+                    });
                 } else {
                     self.set_status("Save cancelled", Kind::Dim);
                 }
+            }
+            Modal::Diff { title, diff, mut scroll, mut reveal, confirm } => {
+                let n = diff.lines.len();
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                        if confirm.is_some() {
+                            self.set_status("Save cancelled", Kind::Dim);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('y') | KeyCode::Char('Y') if confirm.is_some() => {
+                        let p = confirm.expect("checked");
+                        self.effects.push(Effect::WriteFile {
+                            path: p.path,
+                            content: p.content,
+                            overwrite: true,
+                            what: p.what,
+                            skipped: p.skipped,
+                            confirmed: p.confirmed,
+                        });
+                        return;
+                    }
+                    KeyCode::Char('x') if ctrl => {
+                        reveal = !reveal;
+                        if reveal {
+                            self.status_for("Values revealed — Ctrl+X masks them again", Kind::Err, WARN_DURATION);
+                        } else {
+                            self.set_status("Values masked", Kind::Dim);
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        let changes: Vec<usize> =
+                            diff.lines.iter().enumerate().filter(|(_, l)| l.tag.is_change()).map(|(i, _)| i).collect();
+                        let cur = scroll as usize;
+                        let next = if k.code == KeyCode::Char('n') {
+                            changes.iter().find(|&&i| i > cur).or(changes.first())
+                        } else {
+                            changes.iter().rev().find(|&&i| i < cur).or(changes.last())
+                        };
+                        match next {
+                            Some(&i) => scroll = i as u16,
+                            None => self.set_status("No changes", Kind::Dim),
+                        }
+                    }
+                    _ => {
+                        line_scroll(&mut scroll, k, self.view.modal_h, n);
+                    }
+                }
+                self.modal = Some(Modal::Diff { title, diff, scroll, reveal, confirm });
+            }
+            Modal::Findings { title, findings, mut scroll, confirm } => {
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                        if confirm.is_some() {
+                            self.set_status("Save cancelled", Kind::Dim);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('y') | KeyCode::Char('Y') if confirm.is_some() => {
+                        let p = confirm.expect("checked");
+                        self.effects.push(Effect::WriteFile {
+                            path: p.path,
+                            content: p.content,
+                            overwrite: false,
+                            what: p.what,
+                            skipped: p.skipped,
+                            confirmed: true,
+                        });
+                        return;
+                    }
+                    _ => {
+                        line_scroll(&mut scroll, k, self.view.modal_h, self.view.modal_total as usize);
+                    }
+                }
+                self.modal = Some(Modal::Findings { title, findings, scroll, confirm });
             }
         }
     }
@@ -1188,9 +1504,13 @@ impl App {
                 }
                 (PickTarget::SecType, "Secret type (type a custom one)", items, &self.sec_type, true)
             }
-            Focus::Scope => {
+            Focus::Scope | Focus::GoScope => {
                 let items = Scope::ALL.iter().map(|s| s.as_str().to_string()).collect();
                 (PickTarget::Scope, "Scope", items, &self.scope.as_str().to_string(), false)
+            }
+            Focus::GoWorkflow => {
+                let items = Workflow::ALL.iter().map(|w| w.title().to_string()).collect();
+                (PickTarget::Workflow, "GitOps workflow", items, &self.workflow.title().to_string(), false)
             }
             _ => return,
         };
@@ -1243,13 +1563,22 @@ impl App {
             }
             PickTarget::Scope => {
                 self.scope = Scope::ALL.into_iter().find(|s| s.as_str() == v).unwrap_or_default();
+                self.go_changed();
+            }
+            PickTarget::Workflow => {
+                self.workflow = Workflow::ALL.into_iter().find(|w| w.title() == v).unwrap_or_default();
+                self.go_changed();
             }
         }
     }
 
     fn open_prompt(&mut self) {
         let purpose = PathPurpose::Open(self.tab);
-        let init = if self.tab == Tab::Seal { self.cert.value().to_string() } else { String::new() };
+        let init = match self.tab {
+            Tab::Seal => self.cert.value().to_string(),
+            Tab::GitOps => self.go_source.value().to_string(),
+            _ => String::new(),
+        };
         self.modal = Some(Modal::Path { purpose, input: Input::new(init) });
     }
 
@@ -1267,6 +1596,10 @@ impl App {
                 return;
             }
             Tab::Seal => (SaveWhat::Sealed, format!("sealed-{name}.yaml")),
+            Tab::GitOps => {
+                self.gitops_export();
+                return;
+            }
             Tab::Decode => {
                 self.set_status("Nothing to save on this tab", Kind::Dim);
                 return;
@@ -1280,6 +1613,21 @@ impl App {
             PathPurpose::Open(Tab::Seal) => {
                 self.cert.set(path);
                 self.set_status("Certificate set — sealing will use it offline", Kind::Ok);
+            }
+            PathPurpose::Open(Tab::GitOps) => {
+                self.go_source.set(path);
+                self.go_changed();
+                self.set_status("Source set — Ctrl+E seals and checks it", Kind::Ok);
+            }
+            PathPurpose::Diff(what) => {
+                let tok = self.claim("diff-read");
+                self.effects.push(Effect::ReadFile {
+                    tok,
+                    purpose: ReadPurpose::Diff(what),
+                    path,
+                    out_gen: self.out_gen,
+                    kv_gen: self.kv_edit_gen,
+                });
             }
             PathPurpose::Open(tab) => {
                 let (purpose, key) = if tab == Tab::Encode {
@@ -1297,10 +1645,21 @@ impl App {
                 });
             }
             PathPurpose::Save(what) => {
-                let content = if what == SaveWhat::Yaml { self.yaml_out.clone() } else { self.sealed_out.clone() };
+                let content = match what {
+                    SaveWhat::Yaml => self.yaml_out.clone(),
+                    SaveWhat::Sealed => self.sealed_out.clone(),
+                    SaveWhat::Export => self.go_yaml().unwrap_or_default().to_string(),
+                };
                 // Frozen now so the confirmation describes the saved payload.
                 let skipped = self.skipped;
-                self.effects.push(Effect::WriteFile { path, content, overwrite: false, what, skipped });
+                self.effects.push(Effect::WriteFile {
+                    path,
+                    content,
+                    overwrite: false,
+                    what,
+                    skipped,
+                    confirmed: false,
+                });
             }
         }
     }
@@ -1357,6 +1716,18 @@ impl App {
                 self.ctl_ns.clear();
                 self.controller_edited();
             }
+            Focus::GoSource | Focus::GoNs => {
+                if f_input(self).value().is_empty() {
+                    return;
+                }
+                f_input(self).clear();
+                self.go_changed();
+            }
+            Focus::GoOut => {
+                self.go_out.clear();
+                self.go_out_edited();
+            }
+            _ if self.tab == Tab::GitOps => {}
             _ if self.tab == Tab::Seal => {
                 self.cert.clear();
                 self.set_status("Certificate cleared — sealing fetches it from the controller", Kind::Dim);
@@ -1398,6 +1769,13 @@ impl App {
                 (self.sealed_out.clone(), true)
             }
             _ if self.tab == Tab::Encode => (self.yaml_out.clone(), true),
+            _ if self.tab == Tab::GitOps => match self.go_yaml() {
+                Some(y) => (y.to_string(), self.go_source.value().trim().is_empty()),
+                None => {
+                    self.set_status("Preview first (Ctrl+E)", Kind::Err);
+                    return;
+                }
+            },
             _ => (String::new(), false),
         };
         if text.is_empty() {
@@ -1545,7 +1923,370 @@ impl App {
             sealed: self.sealed_out.clone(),
             ctx: self.seal_ctx.clone(),
             ctl,
+            go: None,
         });
+    }
+
+    // ------------------------------------------------------------ GitOps / diff
+
+    /// The current preview's SealedSecret, if there is one.
+    pub fn go_yaml(&self) -> Option<&str> {
+        self.go_preview.as_ref().and_then(|p| p.yaml.as_deref())
+    }
+
+    /// The output path changed: the target checks in the preview were for
+    /// the old one (export re-checks the new one before writing).
+    fn go_out_edited(&mut self) {
+        self.go_exported = None;
+        if let Some(p) = &mut self.go_preview {
+            p.findings.retain(|f| !f.rule.starts_with("target.") && !f.rule.starts_with("kustomize."));
+            p.out.clear();
+        }
+    }
+
+    /// The key the wizard seals with: the Seal tab's certificate, else its
+    /// context's controller. `Err` says what's missing.
+    fn sealing_key(&self) -> Result<SealingKey, String> {
+        let cert = self.cert.value().trim().to_string();
+        let ctl = (self.ctl_ns.value().trim().to_string(), self.ctl_name.value().trim().to_string());
+        if !cert.is_empty() {
+            return Ok((Some(cert.clone()), ctl, SealedWith::Cert(cert)));
+        }
+        if self.seal_ctx.is_empty() || ctl.0.is_empty() || ctl.1.is_empty() {
+            return Err("No sealing certificate: pick a context whose controller is known on the Seal tab (F3), \
+                        or set a certificate file there"
+                .into());
+        }
+        let with = SealedWith::Controller { ctx: self.seal_ctx.clone(), ns: ctl.0.clone(), name: ctl.1.clone() };
+        Ok((None, ctl, with))
+    }
+
+    /// Ctrl+E on the GitOps tab: seal the source for the chosen namespace,
+    /// scope and workflow, and validate everything about the result.
+    fn gitops_preview(&mut self) {
+        if self.go_busy {
+            self.set_status("Still previewing…", Kind::Dim);
+            return;
+        }
+        if self.cert.value().trim().is_empty() && self.detecting() {
+            self.set_status(
+                format!("Detecting the controller for {}… try again in a moment", self.seal_ctx),
+                Kind::Dim,
+            );
+            return;
+        }
+        let src = self.go_source.value().trim().to_string();
+        let source = if src.is_empty() {
+            if self.yaml_out.trim().is_empty() && !self.generate() {
+                return;
+            }
+            Source::Yaml(self.yaml_out.clone())
+        } else {
+            Source::File(src)
+        };
+        let (cert, ctl, with) = match self.sealing_key() {
+            Ok(k) => k,
+            Err(why) => {
+                // A missing certificate is a finding, not just a status line.
+                let f = Finding {
+                    severity: Severity::Critical,
+                    rule: "cert.missing",
+                    resource: "sealing certificate".into(),
+                    key: None,
+                    message: "no certificate to seal with".into(),
+                    remediation: why.clone(),
+                };
+                self.go_preview = Some(GoPreview {
+                    yaml: None,
+                    findings: vec![f],
+                    name: String::new(),
+                    namespace: String::new(),
+                    out: String::new(),
+                });
+                self.set_status(why, Kind::Err);
+                return;
+            }
+        };
+        let ns = self.go_ns.value().trim();
+        let opts = gitops::Options {
+            workflow: self.workflow,
+            scope: self.scope,
+            namespace: (!ns.is_empty()).then(|| ns.to_string()),
+        };
+        self.go_busy = true;
+        self.go_with = Some(with);
+        self.set_status("Sealing and checking…", Kind::Dim);
+        self.effects.push(Effect::GitopsPreview {
+            go_gen: self.go_gen,
+            source,
+            opts,
+            ctx: self.seal_ctx.clone(),
+            cert,
+            ctl,
+            out: self.go_out.value().trim().to_string(),
+        });
+    }
+
+    fn on_gitops_preview(&mut self, go_gen: u64, res: Result<GoPreview, String>) {
+        self.go_busy = false;
+        if go_gen != self.go_gen {
+            self.set_status("Settings changed during the preview — discarded; Ctrl+E again", Kind::Err);
+            return;
+        }
+        let p = match res {
+            Err(e) => {
+                self.go_with = None;
+                self.report_error("Preview failed", e);
+                return;
+            }
+            Ok(p) => p,
+        };
+        if self.go_out.value().trim().is_empty() && !p.out.is_empty() {
+            self.go_out.set(p.out.clone());
+        }
+        let summary = crate::validate::summary(&p.findings);
+        let worst = crate::validate::worst(&p.findings);
+        let (msg, kind) = match (&p.yaml, worst) {
+            (None, _) => (format!("Not sealed — the certificate is unusable ({summary})"), Kind::Err),
+            (_, Some(Severity::Critical)) => (format!("Export blocked: {summary}"), Kind::Err),
+            (_, Some(Severity::High)) => (format!("Preview ready, but check the findings: {summary}"), Kind::Err),
+            _ => (format!("Preview ready ({summary}) — Ctrl+S exports, Ctrl+T asks the controller"), Kind::Ok),
+        };
+        self.go_preview = Some(p);
+        self.go_scroll = Scroll::default();
+        self.go_find_scroll = 0;
+        self.status_for(msg, kind, WARN_DURATION);
+    }
+
+    /// Ctrl+T on the GitOps tab: ask the controller whether it can decrypt
+    /// the preview (it creates nothing).
+    fn gitops_validate(&mut self) {
+        let Some(yaml) = self.go_yaml().map(str::to_string) else {
+            self.set_status("Preview first (Ctrl+E)", Kind::Err);
+            return;
+        };
+        if self.validating || self.sealing {
+            self.set_status("Busy — try again in a moment", Kind::Dim);
+            return;
+        }
+        let ctl = (self.ctl_ns.value().trim().to_string(), self.ctl_name.value().trim().to_string());
+        if self.seal_ctx.is_empty() || ctl.0.is_empty() || ctl.1.is_empty() {
+            self.set_status("The controller check needs a context and its controller (Seal tab, F3)", Kind::Err);
+            return;
+        }
+        self.validating = true;
+        self.validating_with =
+            Some(SealedWith::Controller { ctx: self.seal_ctx.clone(), ns: ctl.0.clone(), name: ctl.1.clone() });
+        self.set_status("Asking the controller…", Kind::Dim);
+        self.effects.push(Effect::Validate {
+            out_gen: self.out_gen,
+            sealed: yaml,
+            ctx: self.seal_ctx.clone(),
+            ctl,
+            go: Some(self.go_gen),
+        });
+    }
+
+    fn on_gitops_validated(&mut self, go_gen: u64, res: Result<bool, String>) {
+        self.validating = false;
+        let against = self.validating_with.take();
+        if go_gen != self.go_gen || self.go_preview.is_none() {
+            self.set_status("The preview changed during the check — discarded", Kind::Err);
+            return;
+        }
+        if let Some(SealedWith::Controller { ctx, .. }) = &against {
+            if *ctx != self.seal_ctx {
+                let msg = format!("Context changed during the check (was {ctx}) — result discarded");
+                self.status_for(msg, Kind::Err, WARN_DURATION);
+                return;
+            }
+        }
+        let against = against.map_or_else(|| "the controller".into(), |a| a.to_string());
+        let sealed = self.go_with.as_ref().map(ToString::to_string);
+        let mismatch = sealed.filter(|s| *s != against);
+        let ok = match res {
+            Err(e) => {
+                self.report_error("Controller check failed", e);
+                return;
+            }
+            Ok(ok) => ok,
+        };
+        self.go_verified = Some(ok);
+        let p = self.go_preview.as_mut().expect("checked");
+        p.findings.retain(|f| !f.rule.starts_with("controller."));
+        let also = mismatch.as_ref().map(|s| format!(" — but it was sealed with {s}")).unwrap_or_default();
+        let res = format!("SealedSecret {}/{}", p.namespace, p.name);
+        let f = if ok {
+            Finding {
+                severity: if mismatch.is_some() { Severity::Medium } else { Severity::Info },
+                rule: "controller.verified",
+                resource: res,
+                key: None,
+                message: format!("{against} can decrypt it (asked via /v1/verify){also}"),
+                remediation: String::new(),
+            }
+        } else {
+            Finding {
+                severity: Severity::High,
+                rule: "controller.cannot-decrypt",
+                resource: res,
+                key: None,
+                message: format!("{against} cannot decrypt it{also}"),
+                remediation:
+                    "Seal it with this controller's certificate, for the namespace/name/scope it is applied with".into(),
+            }
+        };
+        p.findings.push(f);
+        crate::validate::sort(&mut p.findings);
+        if ok && mismatch.is_none() {
+            self.set_status(format!("Verified — {against} can decrypt it"), Kind::Ok);
+        } else if ok {
+            self.status_for(format!("Valid for {against}{also}"), Kind::Err, WARN_DURATION);
+        } else {
+            self.report_error("Invalid seal", format!("{against} cannot decrypt this SealedSecret{also}."));
+        }
+    }
+
+    /// Ctrl+S on the GitOps tab: write the preview to the output path (after
+    /// the target checks; Critical findings block it).
+    fn gitops_export(&mut self) {
+        let Some(p) = &self.go_preview else {
+            self.set_status("Preview first (Ctrl+E)", Kind::Err);
+            return;
+        };
+        let critical: Vec<String> = p
+            .findings
+            .iter()
+            .filter(|f| f.severity == Severity::Critical)
+            .map(|f| format!("{}: {}", f.resource, f.message))
+            .collect();
+        if !critical.is_empty() {
+            self.report_error("Export blocked", format!("Critical findings:\n{}", critical.join("\n")));
+            return;
+        }
+        let Some(content) = p.yaml.clone() else {
+            self.set_status("Nothing to export — the preview has no SealedSecret", Kind::Err);
+            return;
+        };
+        if self.go_out.value().trim().is_empty() {
+            self.go_out.set(gitops::default_file_name(&p.name));
+        }
+        let skipped = if self.go_source.value().trim().is_empty() { self.skipped } else { 0 };
+        self.effects.push(Effect::WriteFile {
+            path: self.go_out.value().trim().to_string(),
+            content,
+            overwrite: false,
+            what: SaveWhat::Export,
+            skipped,
+            confirmed: false,
+        });
+    }
+
+    /// Ctrl+D: compare the tab's output with a local manifest.
+    fn diff_prompt(&mut self) {
+        let what = match self.tab {
+            Tab::Encode => {
+                if self.yaml_out.trim().is_empty() && !self.generate() {
+                    return;
+                }
+                SaveWhat::Yaml
+            }
+            Tab::Seal if !self.sealed_ok => {
+                self.set_status("Seal a secret first", Kind::Err);
+                return;
+            }
+            Tab::Seal => SaveWhat::Sealed,
+            Tab::GitOps => {
+                if self.go_yaml().is_none() {
+                    self.set_status("Preview first (Ctrl+E)", Kind::Err);
+                    return;
+                }
+                let path = self.go_out.value().trim().to_string();
+                if path.is_empty() {
+                    self.set_status("Set the output path to compare with", Kind::Err);
+                    return;
+                }
+                self.path_chosen(PathPurpose::Diff(SaveWhat::Export), path);
+                return;
+            }
+            Tab::Decode => {
+                self.set_status("Ctrl+D compares the Encode, Seal or GitOps output with a local file", Kind::Dim);
+                return;
+            }
+        };
+        self.modal = Some(Modal::Path { purpose: PathPurpose::Diff(what), input: Input::default() });
+    }
+
+    fn current_output(&self, what: SaveWhat) -> Option<&str> {
+        match what {
+            SaveWhat::Yaml => Some(self.yaml_out.as_str()).filter(|y| !y.trim().is_empty()),
+            SaveWhat::Sealed => self.sealed_ok.then_some(self.sealed_out.as_str()),
+            SaveWhat::Export => self.go_yaml(),
+        }
+    }
+
+    fn show_diff(&mut self, path: &str, what: SaveWhat, text: &str) {
+        let Some(current) = self.current_output(what).map(str::to_string) else {
+            self.set_status("The output to compare is gone — generate / seal / preview again", Kind::Err);
+            return;
+        };
+        match diff::diff_texts(text, &current) {
+            Ok(d) => {
+                let label = match what {
+                    SaveWhat::Yaml => "generated YAML",
+                    SaveWhat::Sealed => "sealed output",
+                    SaveWhat::Export => "export preview",
+                };
+                self.set_status(format!("{} → {label}: {}", basename(path), d.summary), Kind::Dim);
+                let title = format!("{} → {label}", basename(path));
+                self.modal = Some(Modal::Diff { title, diff: d, scroll: 0, reveal: false, confirm: None });
+            }
+            Err(e) => self.report_error("Can't compare", format!("{e:#}")),
+        }
+    }
+
+    fn on_written(&mut self, path: String, what: SaveWhat, skipped: usize, res: Result<(), WriteError>) {
+        match res {
+            Ok(()) if what == SaveWhat::Export => {
+                self.go_exported = Some(path.clone());
+                let msg = format!(
+                    "Exported {} — commit it with Git (kseal never commits, pushes or applies)",
+                    basename(&path)
+                );
+                self.status_output(&msg, Some(skipped));
+            }
+            Ok(()) => self.status_output(&format!("Saved {}", basename(&path)), Some(skipped)),
+            Err(WriteError::Exists { content, existing }) => {
+                let pending = PendingWrite { path: path.clone(), content, what, skipped, confirmed: true };
+                match existing.as_deref().map(|old| diff::diff_texts(old, &pending.content)) {
+                    Some(Ok(d)) => {
+                        let title = format!("{} exists — what overwriting it changes", basename(&path));
+                        self.set_status(format!("{} exists: {} — y overwrites", basename(&path), d.summary), Kind::Dim);
+                        self.modal =
+                            Some(Modal::Diff { title, diff: d, scroll: 0, reveal: false, confirm: Some(pending) });
+                    }
+                    _ => {
+                        let PendingWrite { path, content, what, skipped, .. } = pending;
+                        self.modal = Some(Modal::Overwrite { path, content, what, skipped });
+                    }
+                }
+            }
+            Err(WriteError::Risky { content, findings }) => {
+                let blocked = findings.iter().any(|f| f.severity == Severity::Critical);
+                let summary = crate::validate::summary(&findings);
+                let confirm =
+                    (!blocked).then(|| PendingWrite { path: path.clone(), content, what, skipped, confirmed: true });
+                let msg = if blocked {
+                    format!("Not saved — {summary}")
+                } else {
+                    format!("Check before writing: {summary} — y writes anyway")
+                };
+                self.status_for(msg, Kind::Err, WARN_DURATION);
+                let title = format!("Before writing {}", basename(&path));
+                self.modal = Some(Modal::Findings { title, findings, scroll: 0, confirm });
+            }
+            Err(WriteError::Io(e)) => self.report_error("Save failed", e),
+        }
     }
 
     // ------------------------------------------------------------ results
@@ -1607,13 +2348,9 @@ impl App {
             Msg::FileRead { tok, purpose, path, out_gen, kv_gen, res } => {
                 self.on_file_read(tok, purpose, path, out_gen, kv_gen, res)
             }
-            Msg::Written { path, what, skipped, res } => match res {
-                Ok(()) => self.status_output(&format!("Saved {}", basename(&path)), Some(skipped)),
-                Err(WriteError::Exists(content)) => {
-                    self.modal = Some(Modal::Overwrite { path, content, what, skipped });
-                }
-                Err(WriteError::Io(e)) => self.report_error("Save failed", e),
-            },
+            Msg::Written { path, what, skipped, res } => self.on_written(path, what, skipped, res),
+            Msg::GitopsPreviewed { go_gen, res } => self.on_gitops_preview(go_gen, res),
+            Msg::Validated { go: Some(go_gen), res, .. } => self.on_gitops_validated(go_gen, res),
             Msg::Sealed { out_gen, res } => {
                 self.sealing = false;
                 let with = self.sealing_with.take();
@@ -1657,7 +2394,7 @@ impl App {
                     }
                 }
             }
-            Msg::Validated { out_gen, res } => {
+            Msg::Validated { out_gen, go: None, res } => {
                 self.validating = false;
                 let against = self.validating_with.take();
                 if self.discard_stale(out_gen, "validation", "") {
@@ -1849,7 +2586,11 @@ impl App {
         kv_gen: u64,
         res: Result<String, String>,
     ) {
-        let key = if purpose == ReadPurpose::Editor { "editor-read" } else { "decode-read" };
+        let key = match purpose {
+            ReadPurpose::Editor => "editor-read",
+            ReadPurpose::Decode => "decode-read",
+            ReadPurpose::Diff(_) => "diff-read",
+        };
         if !self.is_latest(key, tok) {
             return; // superseded by a newer pick
         }
@@ -1860,6 +2601,10 @@ impl App {
             }
             Ok(t) => t,
         };
+        if let ReadPurpose::Diff(what) = purpose {
+            self.show_diff(&path, what, &text);
+            return;
+        }
         if purpose == ReadPurpose::Decode {
             self.populate_decode(&path, &text);
             return;
@@ -1950,6 +2695,29 @@ pub fn basename(path: &str) -> String {
 
 fn last_line(s: &str) -> String {
     s.trim().lines().last().unwrap_or("").chars().take(120).collect()
+}
+
+/// The text input behind a GitOps text field (for clear).
+fn f_input(app: &mut App) -> &mut Input {
+    let f = app.focus();
+    app.text_input(f)
+}
+
+/// Scroll a list of `n` lines shown `page` at a time. Returns whether it moved.
+fn line_scroll(y: &mut u16, k: KeyEvent, page: u16, n: usize) -> bool {
+    let before = *y;
+    let page = page.max(1);
+    let max = (n as u16).saturating_sub(page);
+    match k.code {
+        KeyCode::Up | KeyCode::Char('k') => *y = y.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => *y = (*y + 1).min(max),
+        KeyCode::PageUp => *y = y.saturating_sub(page),
+        KeyCode::PageDown | KeyCode::Char(' ') => *y = (*y + page).min(max),
+        KeyCode::Home | KeyCode::Char('g') => *y = 0,
+        KeyCode::End | KeyCode::Char('G') => *y = max,
+        _ => {}
+    }
+    *y != before
 }
 
 /// Move the table selection. Returns whether it moved.
@@ -2118,7 +2886,7 @@ mod tests {
         assert!(app.sealed_ok);
         app.on_key(ctrl('t'));
         let Some(Effect::Validate { out_gen, .. }) = take(&mut app).pop() else { panic!() };
-        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(true) });
         assert!(app.status.msg.starts_with("Valid"));
     }
 
@@ -2150,7 +2918,7 @@ mod tests {
         app.on_key(ctrl('t'));
         let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
         assert_eq!(ctx, "prod-a");
-        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(true) });
         assert_eq!((app.status.msg.as_str(), app.status.kind), (&*format!("Valid — {a} can decrypt this"), Kind::Ok));
 
         // Switching context keeps the output, and both answers name the mismatch.
@@ -2158,12 +2926,12 @@ mod tests {
         app.on_key(ctrl('t'));
         let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
         assert_eq!(ctx, "prod-b");
-        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(true) });
         assert_eq!(app.status.kind, Kind::Err, "valid for another cluster must not read as plain success");
         assert!(app.status.msg.ends_with(&format!("but it was sealed with {a}")), "{}", app.status.msg);
         app.on_key(ctrl('t'));
         let Some(Effect::Validate { out_gen, .. }) = take(&mut app).pop() else { panic!() };
-        app.on_msg(Msg::Validated { out_gen, res: Ok(false) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(false) });
         let Some(Modal::Error { detail, .. }) = &app.modal else { panic!("no popup") };
         assert!(detail.contains(&format!("It was sealed with {a}, not")), "{detail}");
     }
@@ -2189,7 +2957,7 @@ mod tests {
         app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
         app.on_key(ctrl('t'));
         let Some(Effect::Validate { out_gen, .. }) = take(&mut app).pop() else { panic!() };
-        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(true) });
         assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
 
         // A queued seal is for the context it was pressed on.
@@ -2222,7 +2990,7 @@ mod tests {
         let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
         assert_eq!(ctx, "dev");
         seal_on(&mut app, "prod");
-        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(true) });
         assert_eq!(app.status.kind, Kind::Err, "{}", app.status.msg);
         assert!(app.status.msg.contains("Context changed during validation (was dev)"), "{}", app.status.msg);
 
@@ -2230,7 +2998,7 @@ mod tests {
         app.on_key(ctrl('t'));
         let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!() };
         assert_eq!(ctx, "prod");
-        app.on_msg(Msg::Validated { out_gen, res: Ok(false) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(false) });
         let Some(Modal::Error { detail, .. }) = &app.modal else { panic!("no popup") };
         assert!(detail.contains("It was sealed with kube-system/sealed-secrets-controller in dev, not"), "{detail}");
     }
@@ -2247,7 +3015,7 @@ mod tests {
         assert_eq!(app.status.msg, "Sealed with the certificate /tmp/other-cluster.pem");
         app.on_key(ctrl('t'));
         let Some(Effect::Validate { out_gen, .. }) = take(&mut app).pop() else { panic!() };
-        app.on_msg(Msg::Validated { out_gen, res: Ok(false) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(false) });
         let Some(Modal::Error { detail, .. }) = &app.modal else { panic!("no popup") };
         assert!(detail.contains("It was sealed with the certificate /tmp/other-cluster.pem, not"), "{detail}");
     }
@@ -2425,10 +3193,12 @@ mod tests {
         let Some(Modal::Path { input, .. }) = &app.modal else { panic!() };
         assert_eq!(input.value(), "my-secret.yaml");
         app.on_key(key(KeyCode::Enter));
-        let Some(Effect::WriteFile { path, content, overwrite: false, what, skipped }) = take(&mut app).pop() else {
+        let Some(Effect::WriteFile { path, content, overwrite: false, what, skipped, confirmed: false }) =
+            take(&mut app).pop()
+        else {
             panic!()
         };
-        app.on_msg(Msg::Written { path, what, skipped, res: Err(WriteError::Exists(content)) });
+        app.on_msg(Msg::Written { path, what, skipped, res: Err(WriteError::Exists { content, existing: None }) });
         app.on_key(key(KeyCode::Char('y')));
         assert!(matches!(take(&mut app).pop(), Some(Effect::WriteFile { overwrite: true, .. })));
     }
@@ -2498,7 +3268,13 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
         assert_eq!(app.tab, Tab::Seal);
         app.on_key(ctrl('n'));
+        assert_eq!(app.tab, Tab::GitOps);
+        app.on_key(ctrl('n'));
         assert_eq!(app.tab, Tab::Encode);
+        app.on_key(ctrl('p'));
+        assert_eq!(app.tab, Tab::GitOps);
+        app.on_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        assert_eq!(app.tab, Tab::GitOps);
         app.on_key(ctrl('q'));
         assert!(app.quit);
     }
@@ -2591,7 +3367,7 @@ mod tests {
         app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
         let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!("not validated") };
         assert_eq!(ctx, "dev");
-        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(true) });
         assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
 
         // A failed seal drops the queued validation.
@@ -2651,8 +3427,237 @@ mod tests {
         app.on_msg(Msg::Sealed { out_gen, res: Ok("kind: SealedSecret\n".into()) });
         let Some(Effect::Validate { out_gen, ctx, .. }) = take(&mut app).pop() else { panic!("not validated") };
         assert_eq!(ctx, "prod");
-        app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
+        app.on_msg(Msg::Validated { out_gen, go: None, res: Ok(true) });
         assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
         assert!(app.status.msg.contains("in prod can decrypt"), "{}", app.status.msg);
+    }
+
+    // --- GitOps wizard / diff / guarded writes -----------------------------
+
+    fn finding(sev: Severity, rule: &'static str) -> Finding {
+        Finding {
+            severity: sev,
+            rule,
+            resource: "SealedSecret prod/db".into(),
+            key: None,
+            message: "m".into(),
+            remediation: String::new(),
+        }
+    }
+
+    /// GitOps tab with a preview in place (answering the dispatched effect).
+    fn previewed(findings: Vec<Finding>) -> App {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\n");
+        app.tab = Tab::GitOps;
+        app.on_key(ctrl('e'));
+        let Some(Effect::GitopsPreview { go_gen, source, opts, ctx, cert, .. }) = take(&mut app).pop() else {
+            panic!("no preview effect")
+        };
+        assert!(matches!(source, Source::Yaml(y) if y.contains("kind: Secret")), "generated from the Encode tab");
+        assert_eq!((opts.workflow, opts.scope, opts.namespace), (Workflow::Generic, Scope::Strict, None));
+        assert_eq!((ctx.as_str(), cert), ("ctx", None));
+        assert!(app.go_busy);
+        let p = GoPreview {
+            yaml: Some("---\napiVersion: bitnami.com/v1alpha1\nkind: SealedSecret\n".into()),
+            findings,
+            name: "my-secret".into(),
+            namespace: "default".into(),
+            out: "sealed-my-secret.yaml".into(),
+        };
+        app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
+        assert!(!app.go_busy && app.go_yaml().is_some());
+        app
+    }
+
+    #[test]
+    fn gitops_preview_fills_the_output_and_exports_after_checks() {
+        let mut app = previewed(vec![finding(Severity::Info, "sealed.structural-only")]);
+        assert_eq!(app.go_out.value(), "sealed-my-secret.yaml");
+        assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
+        app.on_key(ctrl('s'));
+        let Some(Effect::WriteFile {
+            path,
+            content,
+            overwrite: false,
+            what: SaveWhat::Export,
+            skipped,
+            confirmed: false,
+        }) = take(&mut app).pop()
+        else {
+            panic!("no export write")
+        };
+        assert_eq!(path, "sealed-my-secret.yaml");
+        assert!(content.contains("SealedSecret"));
+        app.on_msg(Msg::Written { path, what: SaveWhat::Export, skipped, res: Ok(()) });
+        assert_eq!(app.go_exported.as_deref(), Some("sealed-my-secret.yaml"));
+        assert!(app.status.msg.contains("never commits, pushes or applies"), "{}", app.status.msg);
+    }
+
+    #[test]
+    fn gitops_critical_findings_block_export_and_settings_stale_the_preview() {
+        let mut app = previewed(vec![finding(Severity::Critical, "file.plaintext-secret")]);
+        assert!(app.status.msg.starts_with("Export blocked"));
+        app.on_key(ctrl('s'));
+        assert!(take(&mut app).is_empty(), "nothing is written");
+        assert!(matches!(&app.modal, Some(Modal::Error { title, .. }) if title == "Export blocked"));
+        app.modal = None;
+
+        // Changing the scope (or workflow, namespace, source) drops the preview.
+        app.picked(PickTarget::Workflow, "Flux".into());
+        assert_eq!(app.workflow, Workflow::Flux);
+        assert!(app.go_preview.is_none());
+        app.on_key(ctrl('s'));
+        assert!(take(&mut app).is_empty() && app.status.msg.contains("Preview first"));
+
+        // A preview landing after a change is discarded.
+        app.on_key(ctrl('e'));
+        let Some(Effect::GitopsPreview { go_gen, opts, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(opts.workflow, Workflow::Flux);
+        app.picked(PickTarget::Scope, "cluster-wide".into());
+        let p = GoPreview {
+            yaml: Some("x".into()),
+            findings: vec![],
+            name: "n".into(),
+            namespace: "d".into(),
+            out: "o".into(),
+        };
+        app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
+        assert!(app.go_preview.is_none() && app.status.msg.contains("discarded"));
+    }
+
+    #[test]
+    fn gitops_without_a_key_reports_a_missing_certificate() {
+        let mut app = App::new();
+        open_file(&mut app, "a.env", "A=1\n");
+        app.tab = Tab::GitOps;
+        app.on_key(ctrl('e'));
+        assert!(take(&mut app).is_empty());
+        let p = app.go_preview.as_ref().unwrap();
+        assert_eq!((p.findings[0].severity, p.findings[0].rule), (Severity::Critical, "cert.missing"));
+        assert!(p.yaml.is_none());
+        // A certificate file is enough, and the source can be a file.
+        app.cert.set("/tmp/cert.pem");
+        app.go_source.set("/tmp/secret.yaml");
+        app.set_focus(Focus::GoNs);
+        app.on_paste("staging".into());
+        app.on_key(ctrl('e'));
+        let Some(Effect::GitopsPreview { source, cert, opts, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(source, Source::File("/tmp/secret.yaml".into()));
+        assert_eq!(cert.as_deref(), Some("/tmp/cert.pem"));
+        assert_eq!(opts.namespace.as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn gitops_controller_check_adds_a_finding() {
+        let mut app = previewed(vec![]);
+        app.on_key(ctrl('t'));
+        let Some(Effect::Validate { go: Some(g), sealed, ctx, .. }) = take(&mut app).pop() else { panic!() };
+        assert!(sealed.contains("SealedSecret") && ctx == "ctx");
+        app.on_msg(Msg::Validated { out_gen: 0, go: Some(g), res: Ok(false) });
+        assert_eq!(app.go_verified, Some(false));
+        let f = &app.go_preview.as_ref().unwrap().findings;
+        assert_eq!((f[0].rule, f[0].severity), ("controller.cannot-decrypt", Severity::High));
+        app.modal = None;
+        app.on_key(ctrl('t'));
+        let Some(Effect::Validate { go: Some(g), .. }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::Validated { out_gen: 0, go: Some(g), res: Ok(true) });
+        let f = &app.go_preview.as_ref().unwrap().findings;
+        assert_eq!(
+            f.iter().map(|f| f.rule).collect::<Vec<_>>(),
+            vec!["controller.verified"],
+            "replaces the old verdict"
+        );
+        assert_eq!(app.status.kind, Kind::Ok);
+        // The Seal tab's own validation is untouched by it.
+        assert!(!app.sealed_ok);
+    }
+
+    #[test]
+    fn editing_the_output_path_drops_its_target_checks() {
+        let mut app =
+            previewed(vec![finding(Severity::High, "kustomize.namespace"), finding(Severity::Info, "cert.info")]);
+        app.set_focus(Focus::GoOut);
+        app.on_key(key(KeyCode::Backspace));
+        let f = &app.go_preview.as_ref().unwrap().findings;
+        assert_eq!(f.iter().map(|f| f.rule).collect::<Vec<_>>(), vec!["cert.info"]);
+        assert!(app.go_yaml().is_some(), "the preview itself stays");
+    }
+
+    #[test]
+    fn risky_target_asks_then_overwrite_shows_the_diff() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "PASSWORD=dummy-old\n");
+        app.generate();
+        let new_yaml = app.yaml_out.clone();
+        app.on_key(ctrl('s'));
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::WriteFile { path, content, what, skipped, .. }) = take(&mut app).pop() else { panic!() };
+        // The executor found a High risk: the user is asked first.
+        let findings = vec![finding(Severity::High, "target.plaintext-in-git")];
+        app.on_msg(Msg::Written {
+            path: path.clone(),
+            what,
+            skipped,
+            res: Err(WriteError::Risky { content, findings }),
+        });
+        assert!(matches!(&app.modal, Some(Modal::Findings { confirm: Some(_), .. })));
+        app.on_key(key(KeyCode::Char('y')));
+        let Some(Effect::WriteFile { overwrite: false, confirmed: true, content, .. }) = take(&mut app).pop() else {
+            panic!("y must write without re-asking")
+        };
+        // It exists: the diff opens, values masked, and y overwrites.
+        let old = new_yaml.replace(&core::b64_encode("dummy-old"), &core::b64_encode("dummy-older"));
+        app.on_msg(Msg::Written { path, what, skipped, res: Err(WriteError::Exists { content, existing: Some(old) }) });
+        let Some(Modal::Diff { diff, confirm: Some(_), reveal: false, .. }) = &app.modal else { panic!("no diff") };
+        assert_eq!(diff.summary.changed, 1);
+        assert!(app.status.msg.contains("1 key(s) modified"), "{}", app.status.msg);
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(ctrl('x'));
+        assert!(matches!(&app.modal, Some(Modal::Diff { reveal: true, .. })), "Ctrl+X is an explicit reveal");
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(matches!(take(&mut app).pop(), Some(Effect::WriteFile { overwrite: true, confirmed: true, .. })));
+        assert!(app.modal.is_none());
+
+        // Critical: shown, but no way to write.
+        let findings = vec![finding(Severity::Critical, "target.symlink")];
+        let res = Err(WriteError::Risky { content: "x".into(), findings });
+        app.on_msg(Msg::Written { path: "l.yaml".into(), what, skipped, res });
+        assert!(matches!(&app.modal, Some(Modal::Findings { confirm: None, .. })));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(take(&mut app).is_empty());
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn ctrl_d_diffs_the_output_against_a_file() {
+        let mut app = App::new();
+        open_file(&mut app, "a.env", "A=1\nB=2\n");
+        app.on_key(ctrl('d')); // generates first
+        assert!(!app.yaml_out.is_empty());
+        let Some(Modal::Path { purpose: PathPurpose::Diff(SaveWhat::Yaml), .. }) = &app.modal else { panic!() };
+        app.on_paste("old.yaml".into());
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::ReadFile { tok, purpose, path, out_gen, kv_gen }) = take(&mut app).pop() else { panic!() };
+        let old = "kind: Secret\nmetadata: {name: my-secret, namespace: default}\nstringData: {A: '1', C: '3'}\n";
+        app.on_msg(Msg::FileRead { tok, purpose, path, out_gen, kv_gen, res: Ok(old.into()) });
+        let Some(Modal::Diff { diff, confirm: None, title, .. }) = &app.modal else { panic!("no diff") };
+        assert_eq!(title, "old.yaml → generated YAML");
+        assert_eq!((diff.summary.added, diff.summary.removed), (1, 1));
+        assert_eq!(app.rows.len(), 2, "a diff never touches the editor");
+        app.on_key(key(KeyCode::Esc));
+        // Malformed YAML: a clear error, no diff.
+        app.on_key(ctrl('d'));
+        app.on_paste("bad.yaml".into());
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::ReadFile { tok, purpose, path, out_gen, kv_gen }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::FileRead { tok, purpose, path, out_gen, kv_gen, res: Ok("a: [".into()) });
+        assert!(matches!(&app.modal, Some(Modal::Error { detail, .. }) if detail.starts_with("old: malformed YAML")));
+        // Seal / GitOps need their output first.
+        app.modal = None;
+        app.tab = Tab::Seal;
+        app.on_key(ctrl('d'));
+        assert!(app.modal.is_none() && app.status.msg.contains("Seal a secret first"));
     }
 }

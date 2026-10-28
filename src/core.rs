@@ -387,7 +387,7 @@ impl Entry {
 }
 
 /// Scalar coercion for hand-authored YAML (`K: 0` parses as a number).
-fn scalar_string(v: &Value) -> String {
+pub fn scalar_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
@@ -447,7 +447,7 @@ pub fn first_invalid_key(entries: &[Entry]) -> Option<&str> {
 /// Expand `kind: List` wrappers (from `kubectl get -o yaml`, helm/argo
 /// renders) into their items, however deeply nested. Iterative, so absurd
 /// nesting can't overflow the stack. Non-mapping docs are dropped.
-fn flatten_list_docs(docs: &[Value]) -> Vec<&Value> {
+pub fn flatten_docs(docs: &[Value]) -> Vec<&Value> {
     let mut flat = vec![];
     let mut queue: VecDeque<&Value> = docs.iter().collect();
     while let Some(d) = queue.pop_front() {
@@ -465,7 +465,7 @@ fn flatten_list_docs(docs: &[Value]) -> Vec<&Value> {
     flat
 }
 
-fn kind_of(d: &Value) -> Option<&str> {
+pub fn kind_of(d: &Value) -> Option<&str> {
     d.get("kind").and_then(Value::as_str)
 }
 
@@ -473,7 +473,7 @@ fn kind_of(d: &Value) -> Option<&str> {
 /// always wins over a kind-less fragment carrying data/stringData; other
 /// kinds (ConfigMap, ...) are never picked.
 pub fn select_secret_doc(docs: &[Value]) -> Option<&Value> {
-    let docs = flatten_list_docs(docs);
+    let docs = flatten_docs(docs);
     docs.iter().find(|d| kind_of(d) == Some("Secret")).copied().or_else(|| {
         docs.iter()
             .find(|d| {
@@ -487,7 +487,7 @@ pub fn select_secret_doc(docs: &[Value]) -> Option<&Value> {
 
 /// Whether any doc is a SealedSecret — nothing to decode locally.
 pub fn has_sealed_secret(docs: &[Value]) -> bool {
-    flatten_list_docs(docs).iter().any(|d| kind_of(d) == Some("SealedSecret"))
+    flatten_docs(docs).iter().any(|d| kind_of(d) == Some("SealedSecret"))
 }
 
 /// Parse a (multi-document) YAML string into JSON values. The parser rejects
@@ -497,6 +497,11 @@ pub fn parse_yaml_docs(text: &str) -> anyhow::Result<Vec<Value>> {
     let docs: Vec<Value> = serde_saphyr::from_multiple(text)
         .map_err(|e| anyhow::anyhow!("{}", e.to_string().lines().next().unwrap_or("invalid YAML")))?;
     Ok(docs.into_iter().filter(|d| !d.is_null()).collect())
+}
+
+/// The last component of a `/` or `\\` separated path.
+pub fn file_name(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
 /// Name/namespace/type of a Secret doc, defaulting what's missing.
@@ -683,6 +688,30 @@ pub fn write_secret_file(path: &std::path::Path, content: &str) -> std::io::Resu
         f.write_all(content.as_bytes())?;
         f.sync_all()
     }
+}
+
+/// [`write_secret_file`] for a path the user picked: never writes through a
+/// symbolic link, and unless `overwrite`, creates the file exclusively
+/// (`O_EXCL`) — an existing file is an `AlreadyExists` error, with no window
+/// between checking and writing. Writes nothing to temporary files.
+pub fn save_secret_file(path: &std::path::Path, content: &str, overwrite: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other(format!(
+            "{} is a symbolic link — refusing to write through it",
+            path.display()
+        )));
+    }
+    if overwrite {
+        return write_secret_file(path, content);
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(path)?;
+    f.write_all(content.as_bytes())?;
+    f.sync_all()
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,6 +1073,36 @@ mod tests {
         write_secret_file(&path, "password: café\n").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), "password: café\n".as_bytes());
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn save_secret_file_never_clobbers_or_follows_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sealed.yaml");
+        save_secret_file(&path, "one\n", false).unwrap();
+        let err = save_secret_file(&path, "two\n", false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n", "not overwritten without consent");
+        save_secret_file(&path, "two\n", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            let link = dir.path().join("link.yaml");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            for overwrite in [false, true] {
+                assert!(
+                    save_secret_file(&link, "evil\n", overwrite).unwrap_err().to_string().contains("symbolic link")
+                );
+            }
+            // Dangling links too: O_EXCL alone would refuse, but say why.
+            let dangling = dir.path().join("dangling.yaml");
+            std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+            assert!(save_secret_file(&dangling, "x", false).is_err());
+            assert!(!dir.path().join("nowhere").exists());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+        }
     }
 
     #[test]

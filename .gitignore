@@ -1,5 +1,7 @@
 /target
 *.pem
+# Dummy, cert-only test fixtures (no private keys).
+!tests/fixtures/*.pem
 *.key
 .env
 *.env
