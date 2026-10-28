@@ -87,6 +87,28 @@ In a key table: `a` add, `d` delete, `Enter` edit, `e` edit the value in
 or all. Pickers open with `Enter` and filter as you type. In the diff viewer:
 `n` / `N` next / previous change, `Ctrl+X` reveal values, `Esc` close.
 
+#### Saving (Seal tab)
+
+`Ctrl+S` first looks for where this SealedSecret already lives, so a re-seal
+updates the right file. It searches the repository (`KSEAL_REPO` if set, else
+the Git repo kseal was started in) for a SealedSecret with the same namespace
+and name. Overlays count too, when the folder's `kustomization.yaml` sets the
+namespace. Then it asks the controller you sealed for whether it can decrypt
+each match, with the same read-only check as Ctrl+T, because the same Secret
+often exists once per environment.
+
+- **Matches found:** a "Save to" list, each labelled `this cluster` or
+  `another cluster`, plus a new file. This cluster's match is preselected.
+  Picking another cluster's file warns you first. The choice opens the usual
+  prompt, so you can still edit it.
+- **No match:** the prompt suggests a full path, in this order: the folder you
+  saved to last this session, `<repo>/sealed-<name>.yaml`, or the current
+  folder.
+
+```bash
+export KSEAL_REPO=~/src/gitops-repo   # optional, e.g. in ~/.zshrc
+```
+
 #### Diff (Seal tab)
 
 `Ctrl+D` compares the sealed output with a local Secret or SealedSecret

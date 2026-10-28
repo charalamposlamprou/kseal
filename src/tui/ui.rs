@@ -625,6 +625,7 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
             let list_w = List::new(items)
                 .highlight_style(Style::new().bg(t.accent).fg(t.bg).bold())
                 .highlight_symbol(if *target == PickTarget::Scope { "● " } else { "› " });
+            // (PickTarget::SaveTo lists existing manifests + a new file.)
             f.render_stateful_widget(list_w, list, &mut st);
             Some(Position { x: filt.x + 8 + col, y: filt.y })
         }

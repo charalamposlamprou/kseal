@@ -25,7 +25,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use crate::{cluster, core, seal};
+use crate::{cluster, core, locate, seal};
 use app::{App, Effect, Msg, WriteError};
 use widgets::expand_tilde;
 
@@ -255,6 +255,36 @@ impl Executor<'_> {
                 app.on_msg(Msg::Edited { row, key, original: value, kv_gen, res });
             }
             Effect::ClearClients => kube.clear(),
+            Effect::LocateSave { tok, ns, name, ctl, sealed_file, last_dir } => self.spawn(async move {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let repo_env = std::env::var("KSEAL_REPO").ok();
+                let root = locate::search_root(repo_env.as_deref(), &cwd);
+                let (ns2, name2, root2) = (ns.clone(), name.clone(), root.clone());
+                let hits =
+                    blocking(move || Ok(root2.map(|r| locate::find_manifests(&r, &ns2, &name2)).unwrap_or_default()))
+                        .await
+                        .unwrap_or_default();
+                // Whose each match is: can the controller sealed for decrypt it?
+                // (/v1/verify — creates nothing.) With a certificate: unknown.
+                let mut found = vec![];
+                for h in hits.into_iter().take(10) {
+                    let owner = match &ctl {
+                        Some((ctx, cns, cname)) => {
+                            let ok =
+                                timed(async { cluster::verify(&kube.client(ctx).await?, cns, cname, &h.doc).await });
+                            match ok.await {
+                                Ok(true) => locate::Owner::This,
+                                Ok(false) => locate::Owner::Other,
+                                Err(_) => locate::Owner::Unknown,
+                            }
+                        }
+                        None => locate::Owner::Unknown,
+                    };
+                    found.push(locate::FoundManifest { path: locate::display_path(&h.path, &cwd), owner });
+                }
+                let new_file = locate::new_file_path(&sealed_file, last_dir.as_deref(), root.as_deref());
+                Msg::SaveLocated { tok, new_file, found }
+            }),
             Effect::FetchLive { tok, ctx, ns, name } => self.spawn(async move {
                 let res = timed(async { cluster::get_secret_opt(&kube.client(&ctx).await?, &ns, &name).await }).await;
                 let res = res

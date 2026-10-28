@@ -32,6 +32,7 @@ use super::widgets::{Input, Picker, complete_path};
 use crate::cluster::Contexts;
 use crate::core::{self, Carryover, Entry, EntryKind, FileKind, Pairs};
 use crate::diff;
+use crate::locate::{FoundManifest, Owner};
 use crate::seal::Scope;
 
 pub const STATUS_DURATION: Duration = Duration::from_millis(4000);
@@ -193,6 +194,8 @@ pub enum PickTarget {
     SecType,
     SealCtx,
     Scope,
+    /// Ctrl+S on the Seal tab: an existing manifest, or a new file.
+    SaveTo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +331,17 @@ pub enum Effect {
         kv_gen: u64,
     },
     ClearClients,
+    /// Find where the sealed output already lives (and whose each match
+    /// is) to suggest the save path.
+    LocateSave {
+        tok: Tok,
+        ns: String,
+        name: String,
+        /// `(ctx, controller ns, controller name)` to ask; None with a cert.
+        ctl: Option<(String, String, String)>,
+        sealed_file: String,
+        last_dir: Option<String>,
+    },
     /// Read one Secret from the cluster (read-only) to diff against.
     FetchLive {
         tok: Tok,
@@ -410,6 +424,12 @@ pub enum Msg {
         original: String,
         kv_gen: u64,
         res: Result<String, String>,
+    },
+    SaveLocated {
+        tok: Tok,
+        /// Where a new file would go.
+        new_file: String,
+        found: Vec<FoundManifest>,
     },
     /// `Ok(None)`: no such Secret in the cluster.
     LiveFetched {
@@ -518,6 +538,11 @@ pub struct App {
     ctl_cache: HashMap<String, Option<(String, String)>>,
     ctl_refresh_gen: u64,
 
+    /// The folder the sealed output was last saved to (this session).
+    last_save_dir: Option<String>,
+    /// The matches behind the open "Save to" picker.
+    save_found: Vec<FoundManifest>,
+
     out_gen: u64,
     kv_edit_gen: u64,
 }
@@ -585,6 +610,8 @@ impl App {
             ctl_pending: None,
             ctl_cache: HashMap::new(),
             ctl_refresh_gen: 0,
+            last_save_dir: None,
+            save_found: vec![],
             out_gen: 0,
             kv_edit_gen: 0,
         }
@@ -1324,6 +1351,17 @@ impl App {
             PickTarget::Scope => {
                 self.scope = Scope::ALL.into_iter().find(|s| s.as_str() == v).unwrap_or_default();
             }
+            PickTarget::SaveTo => {
+                let path = v.strip_prefix(NEW_FILE).unwrap_or(&v).split(OWNER_SEP).next().unwrap_or(&v).to_string();
+                if self.save_found.iter().any(|f| f.path == path && f.owner == Owner::Other) {
+                    let msg =
+                        format!("{path} belongs to another cluster — its controller can't decrypt what you sealed");
+                    self.status_for(msg, Kind::Err, WARN_DURATION);
+                }
+                self.save_found.clear();
+                let purpose = PathPurpose::Save(SaveWhat::Sealed);
+                self.modal = Some(Modal::Path { purpose, input: Input::new(path) });
+            }
         }
     }
 
@@ -1334,8 +1372,7 @@ impl App {
     }
 
     fn save_prompt(&mut self) {
-        let name = self.sec_name.value().trim();
-        let name = if name.is_empty() { core::DEF_NAME } else { name };
+        let name = non_empty(self.sec_name.value(), core::DEF_NAME);
         let (what, default) = match self.tab {
             Tab::Encode if self.yaml_out.is_empty() => {
                 self.set_status("Generate YAML first (Ctrl+G)", Kind::Err);
@@ -1346,7 +1383,26 @@ impl App {
                 self.set_status("Seal a secret first", Kind::Err);
                 return;
             }
-            Tab::Seal => (SaveWhat::Sealed, format!("sealed-{name}.yaml")),
+            Tab::Seal => {
+                // Look for where it already lives first (SaveLocated opens the prompt).
+                let docs = core::parse_yaml_docs(&self.sealed_out).unwrap_or_default();
+                let (sname, sns, _) = docs.first().map(core::secret_identity).unwrap_or_default();
+                let ctl = match &self.sealed_with {
+                    Some(SealedWith::Controller { ctx, ns, name }) => Some((ctx.clone(), ns.clone(), name.clone())),
+                    _ => None,
+                };
+                let tok = self.claim("save-locate");
+                self.set_status("Looking for where it already lives…", Kind::Dim);
+                self.effects.push(Effect::LocateSave {
+                    tok,
+                    ns: sns,
+                    name: sname,
+                    ctl,
+                    sealed_file: format!("sealed-{name}.yaml"),
+                    last_dir: self.last_save_dir.clone(),
+                });
+                return;
+            }
             Tab::Decode => {
                 self.set_status("Nothing to save on this tab", Kind::Dim);
                 return;
@@ -1750,8 +1806,39 @@ impl App {
             Msg::FileRead { tok, purpose, path, out_gen, kv_gen, res } => {
                 self.on_file_read(tok, purpose, path, out_gen, kv_gen, res)
             }
+            Msg::SaveLocated { tok, new_file, found } => {
+                if !self.is_latest("save-locate", tok) || !self.sealed_ok {
+                    return;
+                }
+                let purpose = PathPurpose::Save(SaveWhat::Sealed);
+                if found.is_empty() {
+                    self.set_status("Save the SealedSecret — Tab completes", Kind::Dim);
+                    self.modal = Some(Modal::Path { purpose, input: Input::new(new_file) });
+                    return;
+                }
+                let mut items: Vec<String> =
+                    found.iter().map(|f| format!("{}{OWNER_SEP}{}", f.path, f.owner.label())).collect();
+                items.push(format!("{NEW_FILE}{new_file}"));
+                let mine = found.iter().find(|f| f.owner == Owner::This).map(|f| f.path.clone());
+                let current = mine.map(|p| format!("{p}{OWNER_SEP}{}", Owner::This.label())).unwrap_or_default();
+                self.set_status(
+                    format!("{} existing manifest(s) found — pick one, or a new file", found.len()),
+                    Kind::Dim,
+                );
+                self.save_found = found;
+                let picker = Picker::new("Save the SealedSecret to", items, &current, false);
+                self.modal = Some(Modal::Picker { target: PickTarget::SaveTo, picker });
+            }
             Msg::Written { path, what, skipped, res } => match res {
-                Ok(()) => self.status_output(&format!("Saved {}", basename(&path)), Some(skipped)),
+                Ok(()) => {
+                    if what == SaveWhat::Sealed {
+                        self.last_save_dir = std::path::Path::new(&path)
+                            .parent()
+                            .map(|d| d.display().to_string())
+                            .filter(|d| !d.is_empty());
+                    }
+                    self.status_output(&format!("Saved {}", basename(&path)), Some(skipped))
+                }
                 Err(WriteError::Exists(content)) => {
                     self.modal = Some(Modal::Overwrite { path, content, what, skipped });
                 }
@@ -2112,6 +2199,11 @@ pub fn basename(path: &str) -> String {
 fn last_line(s: &str) -> String {
     s.trim().lines().last().unwrap_or("").chars().take(120).collect()
 }
+
+/// Between a found manifest's path and whose it is, in the "Save to" picker.
+const OWNER_SEP: &str = "   · ";
+/// Prefix of the "new file" entry of the "Save to" picker.
+const NEW_FILE: &str = "New file: ";
 
 /// Scroll a list of `n` lines shown `page` at a time. Returns whether it moved.
 fn line_scroll(y: &mut u16, k: KeyEvent, page: u16, n: usize) -> bool {
@@ -2893,5 +2985,61 @@ mod tests {
         let Some(Effect::ReadFile { tok, purpose, path, out_gen, kv_gen }) = take(&mut app).pop() else { panic!() };
         app.on_msg(Msg::FileRead { tok, purpose, path, out_gen, kv_gen, res: Ok("a: [".into()) });
         assert!(matches!(&app.modal, Some(Modal::Error { detail, .. }) if detail.starts_with("old: malformed YAML")));
+    }
+
+    #[test]
+    fn seal_tab_save_suggests_where_it_lives() {
+        let mut app = connected();
+        sealed_for_real(&mut app, "PASSWORD=dummy\n");
+        app.on_key(ctrl('s'));
+        let Some(Effect::LocateSave { tok, ns, name, ctl, sealed_file, last_dir }) = take(&mut app).pop() else {
+            panic!("looks first")
+        };
+        assert_eq!(
+            (ns.as_str(), name.as_str(), sealed_file.as_str()),
+            ("default", "my-secret", "sealed-my-secret.yaml")
+        );
+        assert_eq!(ctl, Some(("prod-a".into(), "kube-system".into(), "sealed-secrets-controller".into())));
+        assert_eq!(last_dir, None);
+        // Found: a picker with whose each file is, plus a new file.
+        let found = vec![
+            FoundManifest { path: "envs/dev/s.yaml".into(), owner: Owner::Other },
+            FoundManifest { path: "envs/prod/s.yaml".into(), owner: Owner::This },
+        ];
+        app.on_msg(Msg::SaveLocated { tok, new_file: "~/repo/sealed-my-secret.yaml".into(), found });
+        let Some(Modal::Picker { target: PickTarget::SaveTo, picker }) = &app.modal else { panic!("no picker") };
+        assert_eq!(
+            picker.items,
+            vec![
+                "envs/dev/s.yaml   · another cluster",
+                "envs/prod/s.yaml   · this cluster",
+                "New file: ~/repo/sealed-my-secret.yaml"
+            ]
+        );
+        assert_eq!(picker.selected, 1, "this cluster's file is preselected");
+        app.on_key(key(KeyCode::Enter));
+        let Some(Modal::Path { purpose: PathPurpose::Save(SaveWhat::Sealed), input }) = &app.modal else { panic!() };
+        assert_eq!(input.value(), "envs/prod/s.yaml", "still a prompt: editable");
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::WriteFile { path, what, skipped, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::Written { path, what, skipped, res: Ok(()) });
+
+        // Next time: the folder saved to last; nothing found → straight to the prompt.
+        app.on_key(ctrl('s'));
+        let Some(Effect::LocateSave { tok, last_dir, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(last_dir.as_deref(), Some("envs/prod"));
+        app.on_msg(Msg::SaveLocated { tok, new_file: "envs/prod/sealed-my-secret.yaml".into(), found: vec![] });
+        let Some(Modal::Path { input, .. }) = &app.modal else { panic!() };
+        assert_eq!(input.value(), "envs/prod/sealed-my-secret.yaml");
+        app.modal = None;
+
+        // Picking another cluster's file warns (the y/N overwrite still asks).
+        app.on_key(ctrl('s'));
+        let Some(Effect::LocateSave { tok, .. }) = take(&mut app).pop() else { panic!() };
+        let found = vec![FoundManifest { path: "envs/dev/s.yaml".into(), owner: Owner::Other }];
+        app.on_msg(Msg::SaveLocated { tok, new_file: "n.yaml".into(), found });
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.status.kind, Kind::Err);
+        assert!(app.status.msg.contains("belongs to another cluster"), "{}", app.status.msg);
     }
 }
