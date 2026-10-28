@@ -280,8 +280,15 @@ fn map_lines(out: &mut Diff, section: &str, a: &BTreeMap<String, String>, b: &BT
     }
 }
 
-/// Compare two normalized resources (old → new).
-pub fn diff_logical(a: &Logical, b: &Logical, out: &mut Diff) {
+const FROM_SOURCE: &str = "new value from the Secret it was sealed from — the old one is encrypted";
+const VIA_SOURCE: &str = "compared with the Secret it was sealed from";
+
+/// Compare two normalized resources (old → new). When `b` is a SealedSecret kseal sealed from `source`
+/// kseal sealed from `source` (a plain Secret it still holds), `b`'s values
+/// are known, so they're
+/// shown (masked) and, against a plain old side, really compared.
+fn diff_with_source(a: &Logical, b: &Logical, source: Option<&Logical>, out: &mut Diff) {
+    let source = source.filter(|_| b.kind == Kind::Sealed);
     out.lines.push(Line::new(Tag::Header, format!("{}  →  {}", a.label(), b.label()), None, None));
     meta_line(out, "name", &a.name, &b.name);
     meta_line(out, "namespace", &a.namespace, &b.namespace);
@@ -299,6 +306,8 @@ pub fn diff_logical(a: &Logical, b: &Logical, out: &mut Diff) {
     for k in keys {
         let field = format!("data.{k}");
         let shown = |v: &Val| Some(Shown::Value(v.clone()));
+        // The plaintext behind b's ciphertext, when kseal sealed it.
+        let src = source.and_then(|s| s.values.get(k)).filter(|_| matches!(b.values.get(k), Some(Val::Encrypted(_))));
         let line = match (a.values.get(k), b.values.get(k)) {
             (Some(x), None) => {
                 out.summary.removed += 1;
@@ -306,7 +315,23 @@ pub fn diff_logical(a: &Logical, b: &Logical, out: &mut Diff) {
             }
             (None, Some(y)) => {
                 out.summary.added += 1;
-                Line::new(Tag::Added, field, None, shown(y))
+                Line::new(Tag::Added, field, None, shown(src.unwrap_or(y)))
+            }
+            (Some(Val::Encrypted(p)), Some(Val::Encrypted(q))) if p == q => {
+                Line::new(Tag::Same, field, shown(a.values.get(k).expect("matched")), None)
+            }
+            (Some(x @ Val::Encrypted(_)), Some(_)) if src.is_some() => {
+                out.summary.unknown += 1;
+                Line::new(Tag::Unknown, field, shown(x), shown(src.expect("checked"))).note(FROM_SOURCE)
+            }
+            (Some(x), Some(_)) if src.is_some() => {
+                let s = src.expect("checked");
+                if plain_bytes(x) == plain_bytes(s) {
+                    Line::new(Tag::Same, field, shown(x), None).note(VIA_SOURCE)
+                } else {
+                    out.summary.changed += 1;
+                    Line::new(Tag::Changed, field, shown(x), shown(s)).note(VIA_SOURCE)
+                }
             }
             (Some(x), Some(y)) => match (x, y) {
                 (Val::Encrypted(p), Val::Encrypted(q)) if p == q => Line::new(Tag::Same, field, shown(x), None),
@@ -355,21 +380,36 @@ fn parse(text: &str, side: &str) -> Result<(Vec<Logical>, Vec<String>)> {
 /// otherwise resources pair up by namespace/name, Secret ↔ SealedSecret
 /// included. Other kinds are ignored and noted.
 pub fn diff_texts(old: &str, new: &str) -> Result<Diff> {
+    diff_texts_from(old, new, None)
+}
+
+/// [`diff_texts`] where `new` was sealed by kseal from the plain Secret
+/// manifest `source`: the new side's values come from it (see
+/// [`diff_with_source`]). A source Secret pairs with a SealedSecret of the
+/// same name (its namespace may have been retargeted), or is the only one.
+pub fn diff_texts_from(old: &str, new: &str, source: Option<&str>) -> Result<Diff> {
     let (a, a_other) = parse(old, "old")?;
     let (b, b_other) = parse(new, "new")?;
+    let sources: Vec<Logical> = match source {
+        Some(t) => parse(t, "source")?.0.into_iter().filter(|l| l.kind == Kind::Secret).collect(),
+        None => vec![],
+    };
+    let source_for = |nb: &Logical| {
+        sources.iter().find(|s| s.name == nb.name).or(if sources.len() == 1 { sources.first() } else { None })
+    };
     if a.is_empty() && b.is_empty() {
         anyhow::bail!("neither side holds a Secret or SealedSecret");
     }
     let mut out = Diff::default();
     if a.len() == 1 && b.len() == 1 {
-        diff_logical(&a[0], &b[0], &mut out);
+        diff_with_source(&a[0], &b[0], source_for(&b[0]), &mut out);
     } else {
         let mut used = vec![false; a.len()];
         for nb in &b {
             match a.iter().enumerate().position(|(i, na)| !used[i] && na.id() == nb.id()) {
                 Some(i) => {
                     used[i] = true;
-                    diff_logical(&a[i], nb, &mut out);
+                    diff_with_source(&a[i], nb, source_for(nb), &mut out);
                 }
                 None => {
                     out.summary.added += nb.values.len();
@@ -517,6 +557,35 @@ mod tests {
         let d = diff_texts(&a, &b).unwrap();
         assert_eq!(changes(&d), vec![('~', "scope"), ('?', "data.PASSWORD"), ('?', "data.USER")]);
         assert!(text_of(&d, false).contains("may or may not have changed"));
+    }
+
+    #[test]
+    fn sealed_new_side_shows_its_source_values() {
+        let src = secret("")
+            .replace("USER: alice", "USER: bob")
+            .replace("  PASSWORD: dummy-s3cret\n", "  PASSWORD: dummy-s3cret\n  TOKEN: dummy-tok\n");
+        let old_sealed = sealed(Scope::Strict, &secret(""));
+        let new_sealed = sealed(Scope::Strict, &src);
+        // Sealed vs sealed: the old value stays unknown, the new one is shown.
+        let d = diff_texts_from(&old_sealed, &new_sealed, Some(&src)).unwrap();
+        let t = text_of(&d, true);
+        assert!(t.contains("? data.USER  ‹encrypted› → \"bob\"  (new value from the Secret"), "{t}");
+        assert!(t.contains("+ data.TOKEN  \"dummy-tok\""), "{t}");
+        assert!(!text_of(&d, false).contains("bob") && !text_of(&d, false).contains("dummy-tok"), "masked by default");
+        // Plain (e.g. the live Secret) vs sealed: compared for real.
+        let d = diff_texts_from(&secret(""), &new_sealed, Some(&src)).unwrap();
+        assert_eq!(changes(&d), vec![("+".chars().next().unwrap(), "data.TOKEN"), ('~', "data.USER")]);
+        assert_eq!((d.summary.changed, d.summary.added, d.summary.unknown), (1, 1, 0));
+        assert!(
+            text_of(&d, true)
+                .contains("~ data.USER  \"alice\" → \"bob\"  (compared with the Secret it was sealed from)")
+        );
+        assert!(text_of(&d, false).contains("  data.PASSWORD  ••••••••  (compared with"), "unchanged values say how");
+        // A retargeted namespace still pairs by name; no source = as before.
+        let moved = sealed(Scope::Strict, &src.replace("namespace: prod", "namespace: staging"));
+        let d = diff_texts_from(&secret(""), &moved, Some(&src)).unwrap();
+        assert_eq!(d.summary.changed, 1);
+        assert_eq!(diff_texts_from(&secret(""), &new_sealed, None).unwrap().summary.unknown, 2);
     }
 
     #[test]

@@ -278,6 +278,9 @@ pub struct GoPreview {
     pub namespace: String,
     /// The output path the target checks ran for.
     pub out: String,
+    /// The plain Secret YAML it was sealed from, so diffs can show the new
+    /// values (masked). Dropped with the preview.
+    pub source_yaml: Option<String>,
 }
 
 #[derive(Debug)]
@@ -387,6 +390,14 @@ pub enum Effect {
         go: Option<u64>,
     },
     /// Seal for the GitOps wizard and validate the result.
+    /// Read one Secret from the cluster (read-only) to diff against.
+    FetchLive {
+        tok: Tok,
+        what: SaveWhat,
+        ctx: String,
+        ns: String,
+        name: String,
+    },
     GitopsPreview {
         go_gen: u64,
         source: Source,
@@ -485,6 +496,13 @@ pub enum Msg {
         out_gen: u64,
         go: Option<u64>,
         res: Result<bool, String>,
+    },
+    /// `Ok(None)`: no such Secret in the cluster.
+    LiveFetched {
+        tok: Tok,
+        what: SaveWhat,
+        label: String,
+        res: Result<Option<String>, String>,
     },
     GitopsPreviewed {
         go_gen: u64,
@@ -1348,7 +1366,9 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let path = input.value().trim().to_string();
-                    if path.is_empty() {
+                    if let (true, PathPurpose::Diff(what)) = (path.is_empty(), purpose) {
+                        self.diff_live(what);
+                    } else if path.is_empty() {
                         self.modal = Some(Modal::Path { purpose, input });
                     } else {
                         self.path_chosen(purpose, path);
@@ -2008,6 +2028,7 @@ impl App {
                     name: String::new(),
                     namespace: String::new(),
                     out: String::new(),
+                    source_yaml: None,
                 });
                 self.set_status(why, Kind::Err);
                 return;
@@ -2210,11 +2231,8 @@ impl App {
                     return;
                 }
                 let path = self.go_out.value().trim().to_string();
-                if path.is_empty() {
-                    self.set_status("Set the output path to compare with", Kind::Err);
-                    return;
-                }
-                self.path_chosen(PathPurpose::Diff(SaveWhat::Export), path);
+                self.modal =
+                    Some(Modal::Path { purpose: PathPurpose::Diff(SaveWhat::Export), input: Input::new(path) });
                 return;
             }
             Tab::Decode => {
@@ -2233,20 +2251,79 @@ impl App {
         }
     }
 
-    fn show_diff(&mut self, path: &str, what: SaveWhat, text: &str) {
+    /// The plain Secret a sealed output was sealed from, when kseal has it.
+    fn output_source(&self, what: SaveWhat) -> Option<&str> {
+        match what {
+            SaveWhat::Yaml => None,
+            SaveWhat::Sealed => self.sealed_ok.then_some(self.yaml_out.as_str()).filter(|y| !y.trim().is_empty()),
+            SaveWhat::Export => self.go_preview.as_ref().and_then(|p| p.source_yaml.as_deref()),
+        }
+    }
+
+    /// Ctrl+D with no path: compare with the Secret the output becomes in
+    /// the cluster — read-only. Encode: the Encode tab's context; Seal /
+    /// GitOps: the context it is sealed for.
+    fn diff_live(&mut self, what: SaveWhat) {
+        let (ctx, ns, name) = match what {
+            SaveWhat::Yaml => (
+                self.enc_ctx.clone(),
+                non_empty(self.sec_ns.value(), core::DEF_NS),
+                non_empty(self.sec_name.value(), core::DEF_NAME),
+            ),
+            SaveWhat::Sealed => {
+                let ctx = match &self.sealed_with {
+                    Some(SealedWith::Controller { ctx, .. }) => ctx.clone(),
+                    _ => self.seal_ctx.clone(),
+                };
+                let docs = core::parse_yaml_docs(&self.sealed_out).unwrap_or_default();
+                let (name, ns, _) = docs.first().map(core::secret_identity).unwrap_or_default();
+                (ctx, ns, name)
+            }
+            SaveWhat::Export => match &self.go_preview {
+                Some(p) => (self.seal_ctx.clone(), p.namespace.clone(), p.name.clone()),
+                None => return,
+            },
+        };
+        if ctx.is_empty() || ns.is_empty() || name.is_empty() {
+            self.set_status("No context / namespace / name to look the live Secret up with", Kind::Err);
+            return;
+        }
+        let tok = self.claim("diff-read");
+        self.set_status(format!("Reading {ns}/{name} from {ctx} (read-only)…"), Kind::Dim);
+        self.effects.push(Effect::FetchLive { tok, what, ctx, ns, name });
+    }
+
+    fn on_live_fetched(&mut self, tok: Tok, what: SaveWhat, label: String, res: Result<Option<String>, String>) {
+        if !self.is_latest("diff-read", tok) {
+            return;
+        }
+        match res {
+            Err(e) => self.report_error("Reading the live Secret failed", e),
+            Ok(Some(json)) => self.show_diff(&label, what, &json),
+            Ok(None) => {
+                self.set_status(format!("{label} doesn't exist yet — everything would be new"), Kind::Dim);
+                self.show_diff(&format!("{label} (not in the cluster)"), what, "");
+            }
+        }
+    }
+
+    /// `old_label` names the old side: a file (its base name) or the live Secret.
+    fn show_diff(&mut self, old_label: &str, what: SaveWhat, text: &str) {
         let Some(current) = self.current_output(what).map(str::to_string) else {
             self.set_status("The output to compare is gone — generate / seal / preview again", Kind::Err);
             return;
         };
-        match diff::diff_texts(text, &current) {
+        let source = self.output_source(what).map(str::to_string);
+        match diff::diff_texts_from(text, &current, source.as_deref()) {
             Ok(d) => {
                 let label = match what {
                     SaveWhat::Yaml => "generated YAML",
                     SaveWhat::Sealed => "sealed output",
                     SaveWhat::Export => "export preview",
                 };
-                self.set_status(format!("{} → {label}: {}", basename(path), d.summary), Kind::Dim);
-                let title = format!("{} → {label}", basename(path));
+                let old = if old_label.starts_with("live ") { old_label.to_string() } else { basename(old_label) };
+                self.set_status(format!("{old} → {label}: {}", d.summary), Kind::Dim);
+                let title = format!("{old} → {label}");
                 self.modal = Some(Modal::Diff { title, diff: d, scroll: 0, reveal: false, confirm: None });
             }
             Err(e) => self.report_error("Can't compare", format!("{e:#}")),
@@ -2358,6 +2435,7 @@ impl App {
             }
             Msg::Written { path, what, skipped, res } => self.on_written(path, what, skipped, res),
             Msg::GitopsPreviewed { go_gen, res } => self.on_gitops_preview(go_gen, res),
+            Msg::LiveFetched { tok, what, label, res } => self.on_live_fetched(tok, what, label, res),
             Msg::Validated { go: Some(go_gen), res, .. } => self.on_gitops_validated(go_gen, res),
             Msg::Sealed { out_gen, res } => {
                 self.sealing = false;
@@ -3472,6 +3550,7 @@ mod tests {
             name: "my-secret".into(),
             namespace: "default".into(),
             out: "sealed-my-secret.yaml".into(),
+            source_yaml: None,
         };
         app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
         assert!(!app.go_busy && app.go_yaml().is_some());
@@ -3516,6 +3595,7 @@ mod tests {
                 name: name.into(),
                 namespace: "ns".into(),
                 out: if out.is_empty() { gitops::default_file_name(name) } else { out.clone() },
+                source_yaml: None,
             };
             app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
             out
@@ -3564,6 +3644,7 @@ mod tests {
             name: "n".into(),
             namespace: "d".into(),
             out: "o".into(),
+            source_yaml: None,
         };
         app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
         assert!(app.go_preview.is_none() && app.status.msg.contains("discarded"));
@@ -3702,5 +3783,60 @@ mod tests {
         app.tab = Tab::Seal;
         app.on_key(ctrl('d'));
         assert!(app.modal.is_none() && app.status.msg.contains("Seal a secret first"));
+    }
+
+    #[test]
+    fn ctrl_d_with_no_path_diffs_against_the_live_secret() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\nB=2\n");
+        app.on_key(ctrl('d'));
+        app.on_key(key(KeyCode::Enter)); // empty path = live
+        let Some(Effect::FetchLive { tok, what, ctx, ns, name }) = take(&mut app).pop() else {
+            panic!("no live fetch")
+        };
+        assert_eq!((what, ctx.as_str(), ns.as_str(), name.as_str()), (SaveWhat::Yaml, "ctx", "default", "my-secret"));
+        let live = json!({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "my-secret", "namespace": "default", "uid": "u"},
+            "data": {"A": core::b64_encode("old"), "B": core::b64_encode("2")}});
+        let label = format!("live {ns}/{name} in {ctx}");
+        app.on_msg(Msg::LiveFetched { tok, what, label: label.clone(), res: Ok(Some(live.to_string())) });
+        let Some(Modal::Diff { diff, title, .. }) = &app.modal else { panic!("no diff") };
+        assert_eq!(title, "live default/my-secret in ctx → generated YAML");
+        assert_eq!((diff.summary.changed, diff.summary.added), (1, 0));
+        // Not in the cluster yet: everything is new.
+        app.modal = None;
+        app.on_key(ctrl('d'));
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::FetchLive { tok, what, .. }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::LiveFetched { tok, what, label, res: Ok(None) });
+        let Some(Modal::Diff { diff, .. }) = &app.modal else { panic!("no diff") };
+        assert_eq!(diff.lines[0].tag, diff::Tag::Added);
+    }
+
+    #[test]
+    fn sealed_output_diffs_show_the_new_values_it_was_sealed_from() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "PASSWORD=dummy-new\n");
+        seal_on(&mut app, "prod-a");
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, yaml, scope, .. }) = take(&mut app).pop() else { panic!() };
+        let sealed = crate::seal::seal_yaml(&yaml, &crate::seal::tests::test_key().to_public_key(), scope).unwrap().0;
+        app.on_msg(Msg::Sealed { out_gen, res: Ok(sealed) });
+        app.on_key(ctrl('d'));
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::FetchLive { tok, what, ctx, ns, name }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(
+            (ctx.as_str(), ns.as_str(), name.as_str()),
+            ("prod-a", "default", "my-secret"),
+            "the sealed-for context"
+        );
+        let live = json!({"kind": "Secret", "metadata": {"name": "my-secret", "namespace": "default"},
+            "data": {"PASSWORD": core::b64_encode("dummy-old")}});
+        app.on_msg(Msg::LiveFetched { tok, what, label: "live".into(), res: Ok(Some(live.to_string())) });
+        let Some(Modal::Diff { diff, .. }) = &app.modal else { panic!("no diff") };
+        assert_eq!((diff.summary.changed, diff.summary.unknown), (1, 0), "really compared, not 'not comparable'");
+        let shown: String = diff.lines.iter().map(|l| diff::render(l, true)).collect();
+        assert!(shown.contains("\"dummy-old\" → \"dummy-new\""), "{shown}");
+        let masked: String = diff.lines.iter().map(|l| diff::render(l, false)).collect();
+        assert!(!masked.contains("dummy-"), "masked until Ctrl+X");
     }
 }

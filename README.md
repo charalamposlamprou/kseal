@@ -81,6 +81,17 @@ or modified (`~`), plus type, scope, labels and annotations. Server-managed
 metadata (`uid`, `resourceVersion`, …) and controller tracking stamps are
 ignored, so a live Secret compares cleanly with its manifest.
 
+Leave the path empty to compare with the **live Secret in the cluster**
+instead: the one the output would replace, read-only. The Encode tab uses its
+own context; the Seal and GitOps tabs use the context they seal for. That
+answers "what will this change in the cluster?" with real values.
+
+When the output is a SealedSecret kseal just sealed, it still holds the plain
+Secret it sealed it from. So the new side's values are known: shown masked, and
+against a plain old side (such as the live Secret) really compared. The old
+side of a sealed-vs-sealed diff stays `‹encrypted›`, since only the controller
+can decrypt it.
+
 Values are masked, with a fixed-width mask that doesn't leak their length.
 Ctrl+X reveals them; it's explicit and per diff. Encrypted values can't be
 compared without the controller's private key, so a ciphertext that differs is

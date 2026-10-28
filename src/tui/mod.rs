@@ -233,6 +233,13 @@ impl Executor<'_> {
                 };
                 Msg::Sealed { out_gen, res: res.await.map_err(cluster_err(&ctx)) }
             }),
+            Effect::FetchLive { tok, what, ctx, ns, name } => self.spawn(async move {
+                let res = timed(async { cluster::get_secret_opt(&kube.client(&ctx).await?, &ns, &name).await }).await;
+                let res = res
+                    .and_then(|v| v.map(|v| serde_json::to_string(&v).map_err(anyhow::Error::from)).transpose())
+                    .map_err(cluster_err(&ctx));
+                Msg::LiveFetched { tok, what, label: format!("live {ns}/{name} in {ctx}"), res }
+            }),
             Effect::GitopsPreview { go_gen, source, opts, ctx, cert, ctl: (ns, name), out } => self.spawn(async move {
                 let res = async {
                     let secret_yaml = match source {
@@ -295,7 +302,14 @@ impl Executor<'_> {
 fn gitops_preview(secret_yaml: &str, pem: &[u8], opts: &gitops::Options, out: &str) -> Result<GoPreview> {
     let (mut findings, info) = validate::cert_findings(pem, validate::now());
     let Some(info) = info else {
-        return Ok(GoPreview { yaml: None, findings, name: String::new(), namespace: String::new(), out: out.into() });
+        return Ok(GoPreview {
+            yaml: None,
+            findings,
+            name: String::new(),
+            namespace: String::new(),
+            out: out.into(),
+            source_yaml: None,
+        });
     };
     let key = seal::parse_cert_pem(pem)?;
     let export = gitops::build(secret_yaml, &key, Some(info.key), opts)?;
@@ -303,7 +317,14 @@ fn gitops_preview(secret_yaml: &str, pem: &[u8], opts: &gitops::Options, out: &s
     findings.extend(export.findings);
     findings.extend(gitops::check_target(&expand_tilde(&out), &export.yaml));
     validate::sort(&mut findings);
-    Ok(GoPreview { yaml: Some(export.yaml), findings, name: export.name, namespace: export.namespace, out })
+    Ok(GoPreview {
+        yaml: Some(export.yaml),
+        findings,
+        name: export.name,
+        namespace: export.namespace,
+        out,
+        source_yaml: Some(secret_yaml.to_string()),
+    })
 }
 
 fn write_osc52(term: &mut Term, text: &str) -> Result<()> {

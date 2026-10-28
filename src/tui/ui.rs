@@ -849,7 +849,7 @@ fn draw_simple_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 PathPurpose::Open(Tab::Decode) => "Open Secret YAML",
                 PathPurpose::Open(Tab::Seal) => "Sealing certificate (PEM)",
                 PathPurpose::Open(Tab::GitOps) => "Secret YAML to export",
-                PathPurpose::Diff(_) => "Compare with a local Secret / SealedSecret manifest",
+                PathPurpose::Diff(_) => "Compare with a file — or leave it empty for the live Secret (read-only)",
                 PathPurpose::Save(SaveWhat::Export) => "Export SealedSecret as (written 0600)",
                 PathPurpose::Save(SaveWhat::Yaml) => "Save Secret YAML as (written 0600)",
                 PathPurpose::Save(SaveWhat::Sealed) => "Save SealedSecret as (written 0600)",
