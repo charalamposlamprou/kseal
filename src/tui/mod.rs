@@ -191,32 +191,36 @@ impl Executor<'_> {
                 let res = blocking(move || read_text(&p)).await.map_err(msg_err);
                 Msg::FileRead { tok, purpose, path, out_gen, kv_gen, res }
             }),
-            Effect::WriteFile { path, content, overwrite, what, skipped, confirmed } => self.spawn(async move {
-                let p = expand_tilde(&path);
-                let res = tokio::task::spawn_blocking(move || {
-                    if !confirmed {
-                        let findings = gitops::check_target(&p, &content);
-                        if findings.iter().any(|f| f.severity <= Severity::High) {
-                            return Err(WriteError::Risky { content, findings });
+            Effect::WriteFile { path, content, overwrite, what, skipped, confirmed, foreign } => {
+                self.spawn(async move {
+                    let p = expand_tilde(&path);
+                    let res = tokio::task::spawn_blocking(move || {
+                        if !confirmed {
+                            let mut findings = gitops::check_target(&p, &content);
+                            findings.extend(gitops::foreign_finding(&p, &foreign));
+                            validate::sort(&mut findings);
+                            if findings.iter().any(|f| f.severity <= Severity::High) {
+                                return Err(WriteError::Risky { content, findings });
+                            }
                         }
-                    }
-                    match core::save_secret_file(&p, &content, overwrite) {
-                        Ok(()) => Ok(()),
-                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                            // For the diff: what's there now (capped; never shown unmasked).
-                            let existing = std::fs::metadata(&p)
-                                .ok()
-                                .filter(|m| m.len() <= 1024 * 1024)
-                                .and_then(|_| std::fs::read_to_string(&p).ok());
-                            Err(WriteError::Exists { content, existing })
+                        match core::save_secret_file(&p, &content, overwrite) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                                // For the diff: what's there now (capped; never shown unmasked).
+                                let existing = std::fs::metadata(&p)
+                                    .ok()
+                                    .filter(|m| m.len() <= 1024 * 1024)
+                                    .and_then(|_| std::fs::read_to_string(&p).ok());
+                                Err(WriteError::Exists { content, existing })
+                            }
+                            Err(e) => Err(WriteError::Io(e.to_string())),
                         }
-                        Err(e) => Err(WriteError::Io(e.to_string())),
-                    }
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(WriteError::Io(e.to_string())));
+                    Msg::Written { path, what, skipped, res }
                 })
-                .await
-                .unwrap_or_else(|e| Err(WriteError::Io(e.to_string())));
-                Msg::Written { path, what, skipped, res }
-            }),
+            }
             Effect::Seal { out_gen, yaml, scope, ctx, cert, ctl: (ns, name) } => self.spawn(async move {
                 let res = async {
                     let pem = match cert {
@@ -247,6 +251,7 @@ impl Executor<'_> {
                             Source::Yaml(y) => y,
                             Source::File(p) => blocking(move || read_text(&p)).await?,
                         };
+                        let cert_mode = cert.is_some();
                         let pem = match cert {
                             Some(path) => blocking(move || read_text(&path).map(String::into_bytes)).await?,
                             None => {
@@ -254,7 +259,26 @@ impl Executor<'_> {
                                     .await?
                             }
                         };
-                        blocking(move || gitops_preview(&secret_yaml, &pem, &opts, &out, &repo)).await
+                        let (preview, found) =
+                            blocking(move || gitops_preview(&secret_yaml, &pem, &opts, &repo)).await?;
+                        // Whose each found manifest is: can THIS cluster's controller decrypt
+                        // it? (/v1/verify — creates nothing). Never asked with a certificate.
+                        let mut owned = vec![];
+                        for (path, doc) in found.into_iter().take(MAX_OWNER_CHECKS) {
+                            let owner = if cert_mode {
+                                gitops::Owner::Unknown
+                            } else {
+                                let ok =
+                                    timed(async { cluster::verify(&kube.client(&ctx).await?, &ns, &name, &doc).await });
+                                match ok.await {
+                                    Ok(true) => gitops::Owner::This,
+                                    Ok(false) => gitops::Owner::Other,
+                                    Err(_) => gitops::Owner::Unknown,
+                                }
+                            };
+                            owned.push(gitops::FoundManifest { path, owner });
+                        }
+                        blocking(move || Ok(gitops_finish(preview, owned, &out))).await
                     };
                     Msg::GitopsPreviewed { go_gen, res: res.await.map_err(cluster_err(&ctx)) }
                 })
@@ -301,29 +325,39 @@ impl Executor<'_> {
     }
 }
 
-/// Seal and check for the GitOps wizard (blocking: RSA, file reads).
-fn gitops_preview(secret_yaml: &str, pem: &[u8], opts: &gitops::Options, out: &str, repo: &str) -> Result<GoPreview> {
+/// Most found manifests a preview asks the controller about.
+const MAX_OWNER_CHECKS: usize = 10;
+
+/// Seal and check for the GitOps wizard (blocking: RSA, file reads), and
+/// find the manifests already defining it: `(display path, doc)`.
+fn gitops_preview(
+    secret_yaml: &str,
+    pem: &[u8],
+    opts: &gitops::Options,
+    repo: &str,
+) -> Result<(GoPreview, Vec<(String, serde_json::Value)>)> {
     let (mut findings, info) = validate::cert_findings(pem, validate::now());
     let Some(info) = info else {
-        return Ok(GoPreview {
+        let p = GoPreview {
             yaml: None,
             findings,
             name: String::new(),
             namespace: String::new(),
-            out: out.into(),
+            out: String::new(),
             source_yaml: None,
             found: vec![],
-        });
+        };
+        return Ok((p, vec![]));
     };
     let key = seal::parse_cert_pem(pem)?;
     let export = gitops::build(secret_yaml, &key, Some(info.key), opts)?;
     // Where it already lives locally, if anywhere: the re-export belongs there.
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = if repo.is_empty() { gitops::git_root(&cwd) } else { Some(expand_tilde(repo)) };
-    let found: Vec<String> = match &root {
+    let found = match &root {
         Some(r) => gitops::find_manifests(r, &export.namespace, &export.name)
-            .iter()
-            .map(|p| gitops::display_path(p, &cwd))
+            .into_iter()
+            .map(|f| (gitops::display_path(&f.path, &cwd), f.doc))
             .collect(),
         None => vec![],
     };
@@ -338,38 +372,34 @@ fn gitops_preview(secret_yaml: &str, pem: &[u8], opts: &gitops::Options, out: &s
             remediation: String::new(),
         });
     }
-    let out = match (out.is_empty(), found.as_slice()) {
-        (true, [only]) => only.clone(),
-        (true, _) => gitops::default_file_name(&export.name),
-        (false, _) => out.to_string(),
-    };
-    if !found.is_empty() {
-        let res = format!("SealedSecret {}/{}", export.namespace, export.name);
-        let message = match found.as_slice() {
-            [only] => format!("existing manifest found at {only}"),
-            many => format!("{} existing manifests define it — Ctrl+O on Output picks one", many.len()),
-        };
-        findings.push(validate::Finding {
-            severity: Severity::Info,
-            rule: "export.found",
-            resource: res,
-            key: None,
-            message,
-            remediation: String::new(),
-        });
-    }
     findings.extend(export.findings);
-    findings.extend(gitops::check_target(&expand_tilde(&out), &export.yaml));
-    validate::sort(&mut findings);
-    Ok(GoPreview {
+    let p = GoPreview {
         yaml: Some(export.yaml),
         findings,
         name: export.name,
         namespace: export.namespace,
-        out,
+        out: String::new(),
         source_yaml: Some(secret_yaml.to_string()),
-        found,
-    })
+        found: vec![],
+    };
+    Ok((p, found))
+}
+
+/// Pick the output (never another cluster's manifest) and check it.
+fn gitops_finish(mut p: GoPreview, found: Vec<gitops::FoundManifest>, out: &str) -> GoPreview {
+    let Some(yaml) = p.yaml.clone() else { return p };
+    let res = format!("SealedSecret {}/{}", p.namespace, p.name);
+    let (out, notes) = gitops::choose_output(&found, out, &p.name, &res);
+    let foreign: Vec<String> =
+        found.iter().filter(|f| f.owner == gitops::Owner::Other).map(|f| f.path.clone()).collect();
+    let target = expand_tilde(&out);
+    p.findings.extend(notes);
+    p.findings.extend(gitops::check_target(&target, &yaml));
+    p.findings.extend(gitops::foreign_finding(&target, &foreign));
+    validate::sort(&mut p.findings);
+    p.out = out;
+    p.found = found;
+    p
 }
 
 fn write_osc52(term: &mut Term, text: &str) -> Result<()> {

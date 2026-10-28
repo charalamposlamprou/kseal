@@ -107,8 +107,18 @@ marked `?` ("may or may not have changed") and never reported as modified.
 
 **Where it goes.** Each preview looks for a SealedSecret manifest with the same
 namespace and name already in your repository, so a re-export lands in the
-file it updates (after the overwrite diff). With one match, it becomes the
-Output; with several, Ctrl+O on Output lists them. The search covers the
+file it updates (after the overwrite diff). Overlays count too: a
+SealedSecret without a namespace matches when its folder's kustomization sets
+one.
+
+The same Secret often exists once per environment (`envs/dev/db.yaml`,
+`envs/prod/db.yaml`). So kseal asks the controller you're sealing for which of
+the found files it can decrypt, using the same read-only check as Ctrl+T. Only
+**this cluster's** file is picked as the Output. Another cluster's file is never
+picked, and exporting over one anyway raises a HIGH `target.other-cluster`
+finding, so you're asked first. Ctrl+O on Output lists every match, labelled
+`this cluster` or `another cluster`. When you seal offline with a certificate,
+there's no controller to ask, so you always choose. The search covers the
 **Repo** folder, or the Git repository kseal was started in when Repo is
 empty. If you start kseal from `~`, set Repo once, or preset it:
 

@@ -292,7 +292,7 @@ pub struct GoPreview {
     pub source_yaml: Option<String>,
     /// Local manifests already defining this SealedSecret (see
     /// [`gitops::find_manifests`]).
-    pub found: Vec<String>,
+    pub found: Vec<gitops::FoundManifest>,
 }
 
 #[derive(Debug)]
@@ -384,6 +384,8 @@ pub enum Effect {
         what: SaveWhat,
         skipped: usize,
         confirmed: bool,
+        /// Manifests known to be another cluster's (writing one asks first).
+        foreign: Vec<String>,
     },
     Seal {
         out_gen: u64,
@@ -1441,6 +1443,7 @@ impl App {
                         what,
                         skipped,
                         confirmed: true,
+                        foreign: vec![],
                     });
                 } else {
                     self.set_status("Save cancelled", Kind::Dim);
@@ -1464,6 +1467,7 @@ impl App {
                             what: p.what,
                             skipped: p.skipped,
                             confirmed: p.confirmed,
+                            foreign: vec![],
                         });
                         return;
                     }
@@ -1512,6 +1516,7 @@ impl App {
                             what: p.what,
                             skipped: p.skipped,
                             confirmed: true,
+                            foreign: vec![],
                         });
                         return;
                     }
@@ -1629,7 +1634,10 @@ impl App {
                 let init = self.go_out_or_default();
                 self.modal = Some(Modal::Path { purpose: PathPurpose::ExportTo, input: Input::new(init) });
             }
-            PickTarget::ExportTo => self.set_go_out(&v),
+            PickTarget::ExportTo => {
+                let path = v.split(OWNER_SEP).next().unwrap_or(&v).to_string();
+                self.set_go_out(&path);
+            }
             PickTarget::Workflow => {
                 self.workflow = Workflow::ALL.into_iter().find(|w| w.title() == v).unwrap_or_default();
                 self.go_changed();
@@ -1646,7 +1654,8 @@ impl App {
         if self.tab == Tab::GitOps && self.focus() == Focus::GoOut {
             let found = self.go_preview.as_ref().map(|p| p.found.clone()).unwrap_or_default();
             if !found.is_empty() {
-                let mut items = found;
+                let mut items: Vec<String> =
+                    found.iter().map(|f| format!("{}{OWNER_SEP}{}", f.path, f.owner.label())).collect();
                 items.push(OTHER_PATH.into());
                 let picker = Picker::new("Export to: existing manifests for it", items, self.go_out.value(), false);
                 self.modal = Some(Modal::Picker { target: PickTarget::ExportTo, picker });
@@ -1738,6 +1747,7 @@ impl App {
                 let content = self.go_yaml().unwrap_or_default().to_string();
                 // The Encode tab's skipped metadata only matters when it is the source.
                 let skipped = if self.go_source.value().trim().is_empty() { self.skipped } else { 0 };
+                let foreign = self.go_foreign();
                 self.effects.push(Effect::WriteFile {
                     path,
                     content,
@@ -1745,6 +1755,7 @@ impl App {
                     what: SaveWhat::Export,
                     skipped,
                     confirmed: false,
+                    foreign,
                 });
             }
             PathPurpose::Save(what) => {
@@ -1762,6 +1773,7 @@ impl App {
                     what,
                     skipped,
                     confirmed: false,
+                    foreign: vec![],
                 });
             }
         }
@@ -2281,6 +2293,13 @@ impl App {
         // Ask where (pre-filled with the Output path; Tab completes).
         let init = self.go_out_or_default();
         self.modal = Some(Modal::Path { purpose: PathPurpose::Save(SaveWhat::Export), input: Input::new(init) });
+    }
+
+    /// Found manifests that belong to another cluster.
+    fn go_foreign(&self) -> Vec<String> {
+        self.go_preview.as_ref().map_or_else(Vec::new, |p| {
+            p.found.iter().filter(|f| f.owner == gitops::Owner::Other).map(|f| f.path.clone()).collect()
+        })
     }
 
     fn go_out_or_default(&self) -> String {
@@ -2856,6 +2875,8 @@ impl App {
 
 /// The "type a path" entry of the Output picker.
 const OTHER_PATH: &str = "Other path…";
+/// Between a found manifest's path and whose it is, in the Output picker.
+const OWNER_SEP: &str = "   · ";
 
 fn template_key(ctx: &str, ns: &str, sec: &str) -> String {
     format!("template\0{ctx}\0{ns}\0{sec}")
@@ -3370,7 +3391,7 @@ mod tests {
         let Some(Modal::Path { input, .. }) = &app.modal else { panic!() };
         assert_eq!(input.value(), "my-secret.yaml");
         app.on_key(key(KeyCode::Enter));
-        let Some(Effect::WriteFile { path, content, overwrite: false, what, skipped, confirmed: false }) =
+        let Some(Effect::WriteFile { path, content, overwrite: false, what, skipped, confirmed: false, .. }) =
             take(&mut app).pop()
         else {
             panic!()
@@ -3667,6 +3688,7 @@ mod tests {
             what: SaveWhat::Export,
             skipped,
             confirmed: false,
+            ..
         }) = take(&mut app).pop()
         else {
             panic!("no export write")
@@ -4022,13 +4044,11 @@ mod tests {
         let land = |app: &mut App, found: Vec<&str>| {
             app.on_key(ctrl('e'));
             let Some(Effect::GitopsPreview { go_gen, out, .. }) = take(app).pop() else { panic!() };
-            let found: Vec<String> = found.into_iter().map(String::from).collect();
-            // What the executor does: one match is the output when it's kseal's to pick.
-            let out = match (out.is_empty(), found.as_slice()) {
-                (true, [only]) => only.clone(),
-                (true, _) => "sealed-my-secret.yaml".into(),
-                (false, _) => out,
-            };
+            let found: Vec<gitops::FoundManifest> = found
+                .into_iter()
+                .map(|p| gitops::FoundManifest { path: p.into(), owner: gitops::Owner::This })
+                .collect();
+            let out = gitops::choose_output(&found, &out, "my-secret", "r").0;
             let p = GoPreview {
                 yaml: Some("y".into()),
                 findings: vec![],
@@ -4048,7 +4068,7 @@ mod tests {
         app.set_focus(Focus::GoOut);
         app.on_key(ctrl('o'));
         let Some(Modal::Picker { target: PickTarget::ExportTo, picker }) = &app.modal else { panic!("no picker") };
-        assert_eq!(picker.items, vec!["a/s.yaml", "b/s.yaml", OTHER_PATH]);
+        assert_eq!(picker.items, vec!["a/s.yaml   · this cluster", "b/s.yaml   · this cluster", OTHER_PATH]);
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.go_out.value(), "b/s.yaml");
@@ -4063,5 +4083,24 @@ mod tests {
         // A path the user chose is kept on the next preview.
         land(&mut app, vec!["c/s.yaml"]);
         assert_eq!(app.go_out.value(), "b/s.yaml");
+    }
+
+    #[test]
+    fn exporting_over_another_clusters_manifest_carries_the_warning() {
+        let mut app = previewed(vec![]);
+        app.go_preview.as_mut().unwrap().found = vec![
+            gitops::FoundManifest { path: "envs/dev/db.yaml".into(), owner: gitops::Owner::Other },
+            gitops::FoundManifest { path: "envs/prod/db.yaml".into(), owner: gitops::Owner::This },
+        ];
+        app.set_focus(Focus::GoOut);
+        app.on_key(ctrl('o'));
+        let Some(Modal::Picker { picker, .. }) = &app.modal else { panic!() };
+        assert_eq!(picker.items[0], "envs/dev/db.yaml   · another cluster");
+        app.on_key(key(KeyCode::Enter)); // pick the dev one anyway
+        assert_eq!(app.go_out.value(), "envs/dev/db.yaml");
+        app.on_key(ctrl('s'));
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::WriteFile { foreign, confirmed: false, .. }) = take(&mut app).pop() else { panic!() };
+        assert_eq!(foreign, vec!["envs/dev/db.yaml"], "the executor's target check sees it");
     }
 }

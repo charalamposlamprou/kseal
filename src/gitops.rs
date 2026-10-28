@@ -304,11 +304,59 @@ const SKIP_DIRS: &[&str] = &["target", "node_modules", "vendor"];
 const MAX_FIND_FILES: usize = 20_000;
 const MAX_FIND_DEPTH: usize = 24;
 
+/// A local manifest defining the SealedSecret being exported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Found {
+    pub path: std::path::PathBuf,
+    /// The matching SealedSecret, its namespace filled in when it comes
+    /// from the directory's kustomization (so the controller can check it).
+    pub doc: Value,
+}
+
+/// Whose a found manifest is, by asking the target cluster's controller
+/// whether it can decrypt it (it creates nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    /// The controller sealed for can decrypt it: this cluster's file.
+    This,
+    /// It can't: sealed for another cluster (or env).
+    Other,
+    /// Not asked (sealing with a certificate) or the check failed.
+    Unknown,
+}
+
+impl Owner {
+    pub fn label(self) -> &'static str {
+        match self {
+            Owner::This => "this cluster",
+            Owner::Other => "another cluster",
+            Owner::Unknown => "cluster unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundManifest {
+    /// Shown / used as the Output (relative to the cwd when under it).
+    pub path: String,
+    pub owner: Owner,
+}
+
+/// The namespace a directory's kustomization sets, if any.
+fn dir_namespace(dir: &Path) -> Option<String> {
+    ["kustomization.yaml", "kustomization.yml", "Kustomization"].iter().find_map(|n| {
+        let docs = core::parse_yaml_docs(&read_capped(&dir.join(n))?).ok()?;
+        docs.first()?.get("namespace")?.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+    })
+}
+
 /// Local manifests (under `root`) defining the SealedSecret `ns`/`name` —
-/// where a re-export most likely belongs. Read-only: YAML files only,
-/// capped in size and count, hidden / build directories skipped, symlinks
-/// never followed. Sorted, so the result is deterministic.
-pub fn find_manifests(root: &Path, ns: &str, name: &str) -> Vec<std::path::PathBuf> {
+/// where a re-export most likely belongs. A SealedSecret without a
+/// namespace counts when its directory's kustomization sets `ns`
+/// (overlays). Read-only: YAML files only, capped in size and count, hidden
+/// / build directories skipped, symlinks never followed. Sorted, so the
+/// result is deterministic.
+pub fn find_manifests(root: &Path, ns: &str, name: &str) -> Vec<Found> {
     let mut found = vec![];
     let mut seen = 0usize;
     let mut stack = vec![(root.to_path_buf(), 0usize)];
@@ -340,17 +388,79 @@ pub fn find_manifests(root: &Path, ns: &str, name: &str) -> Vec<std::path::PathB
                 continue;
             }
             let Ok(docs) = core::parse_yaml_docs(&text) else { continue };
-            let hit = core::flatten_docs(&docs).iter().any(|d| {
+            let kns = std::cell::OnceCell::new();
+            let hit = core::flatten_docs(&docs).into_iter().find(|d| {
                 let (n, s, _) = core::secret_identity(d);
-                core::kind_of(d) == Some("SealedSecret") && n == name && s == ns
+                core::kind_of(d) == Some("SealedSecret")
+                    && n == name
+                    && (s == ns || (s.is_empty() && kns.get_or_init(|| dir_namespace(&dir)).as_deref() == Some(ns)))
             });
-            if hit {
-                found.push(p);
+            if let Some(d) = hit {
+                let mut doc = d.clone();
+                if let Some(m) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+                    m.insert("namespace".into(), json!(ns));
+                }
+                found.push(Found { path: p, doc });
             }
         }
     }
-    found.sort();
+    found.sort_by(|a, b| a.path.cmp(&b.path));
     found
+}
+
+/// Where to export, given the manifests found and whose they are: a path
+/// the user chose stays; otherwise the ONE manifest of this cluster. A file
+/// of another cluster is never picked; with only a certificate (owners
+/// unknown) nothing is, and the user chooses. Plus a note per manifest.
+pub fn choose_output(found: &[FoundManifest], given: &str, name: &str, res: &str) -> (String, Vec<Finding>) {
+    let mine: Vec<&FoundManifest> = found.iter().filter(|f| f.owner == Owner::This).collect();
+    let out = match (given.is_empty(), mine.as_slice()) {
+        (false, _) => given.to_string(),
+        (true, [only]) => only.path.clone(),
+        (true, _) => default_file_name(name),
+    };
+    let notes = found
+        .iter()
+        .map(|f| {
+            let message = match f.owner {
+                Owner::This => {
+                    format!("existing manifest found at {} (this cluster's controller can decrypt it)", f.path)
+                }
+                Owner::Other => format!(
+                    "{} defines it too, but for another cluster — its controller isn't this one; not picked",
+                    f.path
+                ),
+                Owner::Unknown => {
+                    format!("{} defines it — can't tell which cluster it is for; Ctrl+O on Output to choose", f.path)
+                }
+            };
+            Finding {
+                severity: Severity::Info,
+                rule: "export.found",
+                resource: res.to_string(),
+                key: None,
+                message,
+                remediation: String::new(),
+            }
+        })
+        .collect();
+    (out, notes)
+}
+
+/// HIGH when `path` is one of `foreign` (manifests known to be another
+/// cluster's): overwriting it would break that cluster's next sync.
+pub fn foreign_finding(path: &Path, foreign: &[String]) -> Option<Finding> {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canon(path);
+    foreign.iter().any(|f| canon(Path::new(f)) == target).then(|| Finding {
+        severity: Severity::High,
+        rule: "target.other-cluster",
+        resource: path.display().to_string(),
+        key: None,
+        message: "this file was sealed for another cluster — its controller can't decrypt what you're sealing now"
+            .into(),
+        remediation: "Export to this cluster's manifest instead (Ctrl+O on Output lists them)".into(),
+    })
 }
 
 /// `p` relative to `base` when it's under it (shorter to show and type).
@@ -506,17 +616,56 @@ mod tests {
         w("apps/notes.txt", &sealed);
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("apps"), root.join("link")).unwrap();
-        let found: Vec<String> = find_manifests(root, "prod", "db").iter().map(|p| display_path(p, root)).collect();
+        // An overlay without a namespace in the file, set by its kustomization.
+        w(
+            "overlays/prod/db.yaml",
+            &sealed.replace("metadata:\n  name: db\n  namespace: prod\n", "metadata:\n  name: db\n"),
+        );
+        w("overlays/prod/kustomization.yaml", "namespace: prod\nresources: [db.yaml]\n");
+        w(
+            "overlays/dev/db.yaml",
+            &sealed.replace("metadata:\n  name: db\n  namespace: prod\n", "metadata:\n  name: db\n"),
+        );
+        w("overlays/dev/kustomization.yaml", "namespace: dev\nresources: [db.yaml]\n");
+        let hits = find_manifests(root, "prod", "db");
+        let found: Vec<String> = hits.iter().map(|f| display_path(&f.path, root)).collect();
         assert_eq!(
             found,
-            vec!["apps/all.yaml", "apps/prod/db.yaml"],
-            "multi-doc too; no plain, wrong-ns, hidden, build or symlinked paths"
+            vec!["apps/all.yaml", "apps/prod/db.yaml", "overlays/prod/db.yaml"],
+            "multi-doc and overlays too; no plain, wrong-ns, hidden, build or symlinked paths"
         );
+        assert_eq!(hits[2].doc["metadata"]["namespace"], "prod", "filled in for the controller check");
         assert!(find_manifests(root, "prod", "nope").is_empty());
         // root has a .git (written above): it is the repository.
         assert_eq!(git_root(&root.join("apps/prod")), Some(std::fs::canonicalize(root).unwrap()));
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(git_root(plain.path()), None, "not a repository (e.g. ~): no search root");
+    }
+
+    #[test]
+    fn output_is_only_ever_this_clusters_manifest() {
+        let f = |p: &str, owner| FoundManifest { path: p.into(), owner };
+        let res = "SealedSecret shop/db";
+        // One of this cluster's among others: picked.
+        let found = [f("envs/dev/db.yaml", Owner::Other), f("envs/prod/db.yaml", Owner::This)];
+        let (out, notes) = choose_output(&found, "", "db", res);
+        assert_eq!(out, "envs/prod/db.yaml");
+        assert!(notes[0].message.contains("for another cluster") && notes[1].message.contains("can decrypt it"));
+        // Only another cluster's file: never picked.
+        assert_eq!(choose_output(&found[..1], "", "db", res).0, "sealed-db.yaml");
+        // Certificate mode (unknown): never picked; two of this cluster's: ambiguous.
+        assert_eq!(choose_output(&[f("a.yaml", Owner::Unknown)], "", "db", res).0, "sealed-db.yaml");
+        let two = [f("a.yaml", Owner::This), f("b.yaml", Owner::This)];
+        assert_eq!(choose_output(&two, "", "db", res).0, "sealed-db.yaml");
+        // A path the user chose stays.
+        assert_eq!(choose_output(&found, "mine.yaml", "db", res).0, "mine.yaml");
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dev.yaml");
+        std::fs::write(&p, "x").unwrap();
+        let foreign = vec![p.display().to_string()];
+        assert_eq!(foreign_finding(&p, &foreign).unwrap().severity, Severity::High);
+        assert!(foreign_finding(&dir.path().join("prod.yaml"), &foreign).is_none());
     }
 
     #[test]
