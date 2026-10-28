@@ -240,22 +240,25 @@ impl Executor<'_> {
                     .map_err(cluster_err(&ctx));
                 Msg::LiveFetched { tok, what, label: format!("live {ns}/{name} in {ctx}"), res }
             }),
-            Effect::GitopsPreview { go_gen, source, opts, ctx, cert, ctl: (ns, name), out } => self.spawn(async move {
-                let res = async {
-                    let secret_yaml = match source {
-                        Source::Yaml(y) => y,
-                        Source::File(p) => blocking(move || read_text(&p)).await?,
+            Effect::GitopsPreview { go_gen, source, opts, ctx, cert, ctl: (ns, name), out, repo } => {
+                self.spawn(async move {
+                    let res = async {
+                        let secret_yaml = match source {
+                            Source::Yaml(y) => y,
+                            Source::File(p) => blocking(move || read_text(&p)).await?,
+                        };
+                        let pem = match cert {
+                            Some(path) => blocking(move || read_text(&path).map(String::into_bytes)).await?,
+                            None => {
+                                timed(async { cluster::fetch_cert(&kube.client(&ctx).await?, &ns, &name).await })
+                                    .await?
+                            }
+                        };
+                        blocking(move || gitops_preview(&secret_yaml, &pem, &opts, &out, &repo)).await
                     };
-                    let pem = match cert {
-                        Some(path) => blocking(move || read_text(&path).map(String::into_bytes)).await?,
-                        None => {
-                            timed(async { cluster::fetch_cert(&kube.client(&ctx).await?, &ns, &name).await }).await?
-                        }
-                    };
-                    blocking(move || gitops_preview(&secret_yaml, &pem, &opts, &out)).await
-                };
-                Msg::GitopsPreviewed { go_gen, res: res.await.map_err(cluster_err(&ctx)) }
-            }),
+                    Msg::GitopsPreviewed { go_gen, res: res.await.map_err(cluster_err(&ctx)) }
+                })
+            }
             Effect::Validate { out_gen, sealed, ctx, ctl: (ns, name), go } => self.spawn(async move {
                 let res = async {
                     let docs = core::parse_yaml_docs(&sealed)?;
@@ -299,7 +302,7 @@ impl Executor<'_> {
 }
 
 /// Seal and check for the GitOps wizard (blocking: RSA, file reads).
-fn gitops_preview(secret_yaml: &str, pem: &[u8], opts: &gitops::Options, out: &str) -> Result<GoPreview> {
+fn gitops_preview(secret_yaml: &str, pem: &[u8], opts: &gitops::Options, out: &str, repo: &str) -> Result<GoPreview> {
     let (mut findings, info) = validate::cert_findings(pem, validate::now());
     let Some(info) = info else {
         return Ok(GoPreview {
@@ -309,11 +312,52 @@ fn gitops_preview(secret_yaml: &str, pem: &[u8], opts: &gitops::Options, out: &s
             namespace: String::new(),
             out: out.into(),
             source_yaml: None,
+            found: vec![],
         });
     };
     let key = seal::parse_cert_pem(pem)?;
     let export = gitops::build(secret_yaml, &key, Some(info.key), opts)?;
-    let out = if out.is_empty() { gitops::default_file_name(&export.name) } else { out.to_string() };
+    // Where it already lives locally, if anywhere: the re-export belongs there.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let root = if repo.is_empty() { gitops::git_root(&cwd) } else { Some(expand_tilde(repo)) };
+    let found: Vec<String> = match &root {
+        Some(r) => gitops::find_manifests(r, &export.namespace, &export.name)
+            .iter()
+            .map(|p| gitops::display_path(p, &cwd))
+            .collect(),
+        None => vec![],
+    };
+    if root.is_none() {
+        findings.push(validate::Finding {
+            severity: Severity::Info,
+            rule: "export.no-repo",
+            resource: format!("SealedSecret {}/{}", export.namespace, export.name),
+            key: None,
+            message: "not started in a Git repo — set Repo (or KSEAL_REPO) to find where this manifest already lives"
+                .into(),
+            remediation: String::new(),
+        });
+    }
+    let out = match (out.is_empty(), found.as_slice()) {
+        (true, [only]) => only.clone(),
+        (true, _) => gitops::default_file_name(&export.name),
+        (false, _) => out.to_string(),
+    };
+    if !found.is_empty() {
+        let res = format!("SealedSecret {}/{}", export.namespace, export.name);
+        let message = match found.as_slice() {
+            [only] => format!("existing manifest found at {only}"),
+            many => format!("{} existing manifests define it — Ctrl+O on Output picks one", many.len()),
+        };
+        findings.push(validate::Finding {
+            severity: Severity::Info,
+            rule: "export.found",
+            resource: res,
+            key: None,
+            message,
+            remediation: String::new(),
+        });
+    }
     findings.extend(export.findings);
     findings.extend(gitops::check_target(&expand_tilde(&out), &export.yaml));
     validate::sort(&mut findings);
@@ -324,6 +368,7 @@ fn gitops_preview(secret_yaml: &str, pem: &[u8], opts: &gitops::Options, out: &s
         namespace: export.namespace,
         out,
         source_yaml: Some(secret_yaml.to_string()),
+        found,
     })
 }
 

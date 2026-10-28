@@ -105,6 +105,7 @@ pub enum Focus {
     GoNs,
     GoScope,
     GoWorkflow,
+    GoRepo,
     GoOut,
     GoPreview,
     GoFindings,
@@ -117,7 +118,7 @@ impl Focus {
             Tab::Encode => &[SvIn, SvOut, EncCtx, EncNs, EncSecret, Rows, SecName, SecNs, SecType, Yaml],
             Tab::Decode => &[DvIn, DvOut, DecRows],
             Tab::Seal => &[SealCtx, Scope, CtlName, CtlNs, Cert, Sealed],
-            Tab::GitOps => &[GoSource, GoNs, GoScope, GoWorkflow, GoOut, GoPreview, GoFindings],
+            Tab::GitOps => &[GoSource, GoNs, GoScope, GoWorkflow, GoRepo, GoOut, GoPreview, GoFindings],
         }
     }
     /// The tab's fields as laid out on screen, row by row: what the arrow
@@ -130,13 +131,15 @@ impl Focus {
             }
             Tab::Decode => &[&[DvIn], &[DvOut], &[DecRows]],
             Tab::Seal => &[&[SealCtx, Scope], &[CtlName, CtlNs], &[Cert], &[Sealed]],
-            Tab::GitOps => &[&[GoSource], &[GoNs, GoScope], &[GoWorkflow], &[GoOut], &[GoPreview, GoFindings]],
+            Tab::GitOps => {
+                &[&[GoSource], &[GoNs, GoScope], &[GoWorkflow], &[GoRepo], &[GoOut], &[GoPreview, GoFindings]]
+            }
         }
     }
     /// Fields that take typed text (so `?` and letters are input, not keys).
     pub fn is_text(self) -> bool {
         use Focus::*;
-        matches!(self, SvIn | DvIn | SecName | SecNs | CtlName | CtlNs | Cert | GoSource | GoNs | GoOut)
+        matches!(self, SvIn | DvIn | SecName | SecNs | CtlName | CtlNs | Cert | GoSource | GoNs | GoRepo | GoOut)
     }
 }
 
@@ -218,6 +221,8 @@ pub enum PickTarget {
     SealCtx,
     Scope,
     Workflow,
+    /// The GitOps Output: an existing manifest, or another path.
+    ExportTo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +235,8 @@ pub enum PathPurpose {
     Diff(SaveWhat),
     /// Where the GitOps wizard exports to (sets the Output field only).
     ExportTo,
+    /// The repository folder searched for existing manifests.
+    Repo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +290,9 @@ pub struct GoPreview {
     /// The plain Secret YAML it was sealed from, so diffs can show the new
     /// values (masked). Dropped with the preview.
     pub source_yaml: Option<String>,
+    /// Local manifests already defining this SealedSecret (see
+    /// [`gitops::find_manifests`]).
+    pub found: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -408,6 +418,8 @@ pub enum Effect {
         cert: Option<String>,
         ctl: (String, String),
         out: String,
+        /// Where to look for an existing manifest ("" = the Git repo of the cwd).
+        repo: String,
     },
     Copy {
         text: String,
@@ -636,6 +648,9 @@ pub struct App {
     pub go_ns: Input,
     pub workflow: Workflow,
     pub go_out: Input,
+    /// Folder searched for an existing manifest of the export; empty = the
+    /// Git repo kseal was started in (if any). Preset by `KSEAL_REPO`.
+    pub go_repo: Input,
     /// The output path is kseal's default (never typed): it follows the
     /// Secret being previewed.
     go_out_auto: bool,
@@ -721,6 +736,7 @@ impl App {
             go_ns: Input::default(),
             workflow: Workflow::default(),
             go_out: Input::default(),
+            go_repo: Input::new(std::env::var("KSEAL_REPO").unwrap_or_default()),
             go_out_auto: true,
             go_preview: None,
             go_busy: false,
@@ -1098,6 +1114,7 @@ impl App {
             Focus::CtlNs => &mut self.ctl_ns,
             Focus::GoSource => &mut self.go_source,
             Focus::GoNs => &mut self.go_ns,
+            Focus::GoRepo => &mut self.go_repo,
             Focus::GoOut => &mut self.go_out,
             _ => &mut self.cert,
         }
@@ -1130,9 +1147,8 @@ impl App {
             Focus::Cert => {
                 self.cert.handle(k);
             }
-            Focus::GoSource | Focus::GoNs => {
-                let input = if f == Focus::GoSource { &mut self.go_source } else { &mut self.go_ns };
-                if input.handle(k) {
+            Focus::GoSource | Focus::GoNs | Focus::GoRepo => {
+                if self.text_input(f).handle(k) {
                     self.go_changed();
                 }
             }
@@ -1333,9 +1349,8 @@ impl App {
                     self.ctl_ns.insert_str(&line);
                     self.controller_edited();
                 }
-                Focus::GoSource | Focus::GoNs => {
-                    let input = if self.focus() == Focus::GoSource { &mut self.go_source } else { &mut self.go_ns };
-                    input.insert_str(&line);
+                f @ (Focus::GoSource | Focus::GoNs | Focus::GoRepo) => {
+                    self.text_input(f).insert_str(&line);
                     self.go_changed();
                 }
                 Focus::GoOut => {
@@ -1610,6 +1625,11 @@ impl App {
                 self.scope = Scope::ALL.into_iter().find(|s| s.as_str() == v).unwrap_or_default();
                 self.go_changed();
             }
+            PickTarget::ExportTo if v == OTHER_PATH => {
+                let init = self.go_out_or_default();
+                self.modal = Some(Modal::Path { purpose: PathPurpose::ExportTo, input: Input::new(init) });
+            }
+            PickTarget::ExportTo => self.set_go_out(&v),
             PickTarget::Workflow => {
                 self.workflow = Workflow::ALL.into_iter().find(|w| w.title() == v).unwrap_or_default();
                 self.go_changed();
@@ -1618,7 +1638,20 @@ impl App {
     }
 
     fn open_prompt(&mut self) {
+        if self.tab == Tab::GitOps && self.focus() == Focus::GoRepo {
+            let init = self.go_repo.value().to_string();
+            self.modal = Some(Modal::Path { purpose: PathPurpose::Repo, input: Input::new(init) });
+            return;
+        }
         if self.tab == Tab::GitOps && self.focus() == Focus::GoOut {
+            let found = self.go_preview.as_ref().map(|p| p.found.clone()).unwrap_or_default();
+            if !found.is_empty() {
+                let mut items = found;
+                items.push(OTHER_PATH.into());
+                let picker = Picker::new("Export to: existing manifests for it", items, self.go_out.value(), false);
+                self.modal = Some(Modal::Picker { target: PickTarget::ExportTo, picker });
+                return;
+            }
             let init = self.go_out_or_default();
             self.modal = Some(Modal::Path { purpose: PathPurpose::ExportTo, input: Input::new(init) });
             return;
@@ -1695,6 +1728,11 @@ impl App {
                 });
             }
             PathPurpose::ExportTo => self.set_go_out(&path),
+            PathPurpose::Repo => {
+                self.go_repo.set(path);
+                self.go_changed();
+                self.set_status("Repo set — Ctrl+E looks for an existing manifest there", Kind::Ok);
+            }
             PathPurpose::Save(SaveWhat::Export) => {
                 self.set_go_out(&path);
                 let content = self.go_yaml().unwrap_or_default().to_string();
@@ -1781,7 +1819,7 @@ impl App {
                 self.ctl_ns.clear();
                 self.controller_edited();
             }
-            Focus::GoSource | Focus::GoNs => {
+            Focus::GoSource | Focus::GoNs | Focus::GoRepo => {
                 if f_input(self).value().is_empty() {
                     return;
                 }
@@ -2070,6 +2108,7 @@ impl App {
                     namespace: String::new(),
                     out: String::new(),
                     source_yaml: None,
+                    found: vec![],
                 });
                 self.set_status(why, Kind::Err);
                 return;
@@ -2093,6 +2132,7 @@ impl App {
             ctl,
             // The default is recomputed for the Secret actually previewed.
             out: if self.go_out_auto { String::new() } else { self.go_out.value().trim().to_string() },
+            repo: self.go_repo.value().trim().to_string(),
         });
     }
 
@@ -2813,6 +2853,9 @@ impl App {
         self.set_status(format!("Loaded {} key(s)", self.dec_rows.len()), Kind::Ok);
     }
 }
+
+/// The "type a path" entry of the Output picker.
+const OTHER_PATH: &str = "Other path…";
 
 fn template_key(ctx: &str, ns: &str, sec: &str) -> String {
     format!("template\0{ctx}\0{ns}\0{sec}")
@@ -3599,6 +3642,7 @@ mod tests {
             namespace: "default".into(),
             out: "sealed-my-secret.yaml".into(),
             source_yaml: None,
+            found: vec![],
         };
         app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
         assert!(!app.go_busy && app.go_yaml().is_some());
@@ -3649,6 +3693,7 @@ mod tests {
                 namespace: "ns".into(),
                 out: if out.is_empty() { gitops::default_file_name(name) } else { out.clone() },
                 source_yaml: None,
+                found: vec![],
             };
             app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
             out
@@ -3698,6 +3743,7 @@ mod tests {
             namespace: "d".into(),
             out: "o".into(),
             source_yaml: None,
+            found: vec![],
         };
         app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
         assert!(app.go_preview.is_none() && app.status.msg.contains("discarded"));
@@ -3913,6 +3959,7 @@ mod tests {
             namespace: "d".into(),
             out: "o".into(),
             source_yaml: None,
+            found: vec![],
         };
         app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
         assert!(app.go_preview.is_none(), "the preview of the old YAML lands stale");
@@ -3965,5 +4012,56 @@ mod tests {
         app.set_focus(Focus::GoSource);
         app.on_key(ctrl('o'));
         assert!(matches!(&app.modal, Some(Modal::Path { purpose: PathPurpose::Open(Tab::GitOps), .. })));
+    }
+
+    #[test]
+    fn found_manifests_become_the_output_and_can_be_picked() {
+        let mut app = connected();
+        open_file(&mut app, "a.env", "A=1\n");
+        app.tab = Tab::GitOps;
+        let land = |app: &mut App, found: Vec<&str>| {
+            app.on_key(ctrl('e'));
+            let Some(Effect::GitopsPreview { go_gen, out, .. }) = take(app).pop() else { panic!() };
+            let found: Vec<String> = found.into_iter().map(String::from).collect();
+            // What the executor does: one match is the output when it's kseal's to pick.
+            let out = match (out.is_empty(), found.as_slice()) {
+                (true, [only]) => only.clone(),
+                (true, _) => "sealed-my-secret.yaml".into(),
+                (false, _) => out,
+            };
+            let p = GoPreview {
+                yaml: Some("y".into()),
+                findings: vec![],
+                name: "my-secret".into(),
+                namespace: "default".into(),
+                out,
+                source_yaml: None,
+                found,
+            };
+            app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
+        };
+        land(&mut app, vec!["apps/default/my-secret.yaml"]);
+        assert_eq!(app.go_out.value(), "apps/default/my-secret.yaml");
+        // Several: Ctrl+O on Output lists them (and "Other path…").
+        app.picked(PickTarget::Workflow, "Flux".into());
+        land(&mut app, vec!["a/s.yaml", "b/s.yaml"]);
+        app.set_focus(Focus::GoOut);
+        app.on_key(ctrl('o'));
+        let Some(Modal::Picker { target: PickTarget::ExportTo, picker }) = &app.modal else { panic!("no picker") };
+        assert_eq!(picker.items, vec!["a/s.yaml", "b/s.yaml", OTHER_PATH]);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.go_out.value(), "b/s.yaml");
+        app.on_key(ctrl('o'));
+        app.on_key(key(KeyCode::End));
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&app.modal, Some(Modal::Path { purpose: PathPurpose::ExportTo, .. })), "Other path… prompts");
+        app.modal = None;
+        // A path the user chose is kept on the next preview.
+        land(&mut app, vec!["c/s.yaml"]);
+        assert_eq!(app.go_out.value(), "b/s.yaml");
     }
 }

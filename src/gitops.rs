@@ -292,6 +292,74 @@ pub fn payload_of(content: &str) -> Payload {
     }
 }
 
+/// The Git working tree `dir` is in — where [`find_manifests`] searches
+/// when no repository was named. `None` outside one: kseal never crawls an
+/// arbitrary directory (say, `~`) on its own.
+pub fn git_root(dir: &Path) -> Option<std::path::PathBuf> {
+    let abs = std::fs::canonicalize(dir).ok()?;
+    abs.ancestors().find(|a| a.join(".git").exists()).map(Path::to_path_buf)
+}
+
+const SKIP_DIRS: &[&str] = &["target", "node_modules", "vendor"];
+const MAX_FIND_FILES: usize = 20_000;
+const MAX_FIND_DEPTH: usize = 24;
+
+/// Local manifests (under `root`) defining the SealedSecret `ns`/`name` —
+/// where a re-export most likely belongs. Read-only: YAML files only,
+/// capped in size and count, hidden / build directories skipped, symlinks
+/// never followed. Sorted, so the result is deterministic.
+pub fn find_manifests(root: &Path, ns: &str, name: &str) -> Vec<std::path::PathBuf> {
+    let mut found = vec![];
+    let mut seen = 0usize;
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.filter_map(Result::ok) {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() || n.starts_with('.') {
+                continue;
+            }
+            let p = e.path();
+            if ft.is_dir() {
+                if depth < MAX_FIND_DEPTH && !SKIP_DIRS.contains(&n.as_str()) {
+                    stack.push((p, depth + 1));
+                }
+                continue;
+            }
+            if !(n.ends_with(".yaml") || n.ends_with(".yml")) {
+                continue;
+            }
+            seen += 1;
+            if seen > MAX_FIND_FILES {
+                break;
+            }
+            let Some(text) = read_capped(&p) else { continue };
+            // Cheap filter before parsing.
+            if !text.contains("SealedSecret") || !text.contains(name) {
+                continue;
+            }
+            let Ok(docs) = core::parse_yaml_docs(&text) else { continue };
+            let hit = core::flatten_docs(&docs).iter().any(|d| {
+                let (n, s, _) = core::secret_identity(d);
+                core::kind_of(d) == Some("SealedSecret") && n == name && s == ns
+            });
+            if hit {
+                found.push(p);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// `p` relative to `base` when it's under it (shorter to show and type).
+pub fn display_path(p: &Path, base: &Path) -> String {
+    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    p.strip_prefix(&base).map_or_else(|_| p.display().to_string(), |r| r.display().to_string())
+}
+
 /// Pre-write checks for `content` at `path` (read-only I/O + pure rules).
 pub fn check_target(path: &Path, content: &str) -> Vec<Finding> {
     let payload = payload_of(content);
@@ -417,6 +485,38 @@ mod tests {
         assert_eq!(payload_of("{{{"), Payload::PlainSecret);
         assert_eq!(default_file_name("db"), "sealed-db.yaml");
         assert_eq!(default_file_name(" "), "sealed-my-secret.yaml");
+    }
+
+    #[test]
+    fn find_manifests_locates_the_existing_sealed_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sealed = export(Workflow::Generic, Scope::Strict, None).yaml; // prod/db
+        let w = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        w("apps/prod/db.yaml", &sealed);
+        w("apps/all.yaml", &format!("kind: ConfigMap\n---\n{sealed}"));
+        w("apps/staging/db.yaml", &sealed.replace("namespace: prod", "namespace: staging"));
+        w("apps/plain.yaml", "kind: Secret\nmetadata: {name: db, namespace: prod}\n");
+        w(".git/objects/db.yaml", &sealed);
+        w("target/db.yaml", &sealed);
+        w("apps/notes.txt", &sealed);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("apps"), root.join("link")).unwrap();
+        let found: Vec<String> = find_manifests(root, "prod", "db").iter().map(|p| display_path(p, root)).collect();
+        assert_eq!(
+            found,
+            vec!["apps/all.yaml", "apps/prod/db.yaml"],
+            "multi-doc too; no plain, wrong-ns, hidden, build or symlinked paths"
+        );
+        assert!(find_manifests(root, "prod", "nope").is_empty());
+        // root has a .git (written above): it is the repository.
+        assert_eq!(git_root(&root.join("apps/prod")), Some(std::fs::canonicalize(root).unwrap()));
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(git_root(plain.path()), None, "not a repository (e.g. ~): no search root");
     }
 
     #[test]

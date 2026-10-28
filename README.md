@@ -105,6 +105,21 @@ marked `?` ("may or may not have changed") and never reported as modified.
 | Argo CD | Also drops `argocd.argoproj.io/tracking-id` (and Flux's labels) from the template, so a Secret loaded from a cluster doesn't carry its old owner into Git |
 | Flux | The same, plus a reminder that a Kustomization's `spec.targetNamespace` must match the sealed namespace |
 
+**Where it goes.** Each preview looks for a SealedSecret manifest with the same
+namespace and name already in your repository, so a re-export lands in the
+file it updates (after the overwrite diff). With one match, it becomes the
+Output; with several, Ctrl+O on Output lists them. The search covers the
+**Repo** folder, or the Git repository kseal was started in when Repo is
+empty. If you start kseal from `~`, set Repo once, or preset it:
+
+```bash
+export KSEAL_REPO=~/src/gitops-repo   # e.g. in ~/.zshrc
+```
+
+The search is read-only. It reads YAML files only, skips hidden and build
+directories, never follows symlinks, and never crawls a folder that isn't a
+Git repository unless you name it.
+
 The output is deterministic apart from the ciphertext, which sealed-secrets
 randomizes on every seal by design. kubectl's last-applied snapshot is always
 dropped. Labels and annotations are preserved.

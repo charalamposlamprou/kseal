@@ -574,7 +574,8 @@ fn diff_line(l: &diff::Line, reveal: bool) -> Line<'static> {
 fn draw_gitops(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Position>) {
     let t = theme();
     let fo = app.focus();
-    let [h1, steps, keyl, r1, r2, r3, r4, buttons, body] = Layout::vertical([
+    let [h1, steps, keyl, r1, r2, r3, rr, r4, buttons, body] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -658,8 +659,17 @@ fn draw_gitops(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Positi
     *cur = field(f, n, "2 Namespace", W, ns, fo == Focus::GoNs).or(*cur);
     field(f, sc, "Scope", 5, Content::Picker(app.scope.as_str().into()), fo == Focus::GoScope);
     field(f, r3, "3 Workflow", W, Content::Picker(app.workflow.title().into()), fo == Focus::GoWorkflow);
-    let out =
-        Content::Input { input: &app.go_out, masked: false, placeholder: "(sealed-<name>.yaml — Ctrl+O to choose)" };
+    let repo = Content::Input {
+        input: &app.go_repo,
+        masked: false,
+        placeholder: "(the Git repo kseal started in — Ctrl+O to pick the folder where your manifests live)",
+    };
+    *cur = field(f, rr, "  Repo", W, repo, fo == Focus::GoRepo).or(*cur);
+    let out = Content::Input {
+        input: &app.go_out,
+        masked: false,
+        placeholder: "(the existing manifest if found, else sealed-<name>.yaml — Ctrl+O to choose)",
+    };
     *cur = field(f, r4, "6 Output", W, out, fo == Focus::GoOut).or(*cur);
 
     let busy = app.go_busy;
@@ -746,6 +756,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Focus::GoSource => "Ctrl+O pick a Secret YAML · empty = the Encode tab's Secret · Ctrl+E preview",
             Focus::GoNs => "seal for this namespace · empty = the Secret's own · Ctrl+E preview",
             Focus::GoScope | Focus::GoWorkflow => "Enter pick · Ctrl+E preview",
+            Focus::GoRepo => "the folder searched for where this manifest already lives · Ctrl+O pick · Ctrl+E search",
             Focus::GoOut => "Ctrl+O choose where · Ctrl+S export (asks where) · Ctrl+D diff against it",
             Focus::GoPreview | Focus::GoFindings => {
                 "↑↓ scroll · Ctrl+E preview · Ctrl+T controller · Ctrl+D diff · Ctrl+S export"
@@ -851,6 +862,7 @@ fn draw_simple_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 PathPurpose::Open(Tab::Seal) => "Sealing certificate (PEM)",
                 PathPurpose::Open(Tab::GitOps) => "Source: the Secret YAML to seal",
                 PathPurpose::ExportTo => "Export to (path; Tab completes)",
+                PathPurpose::Repo => "Repository folder to look for the existing manifest in",
                 PathPurpose::Diff(_) => "Compare with a file — or leave it empty for the live Secret (read-only)",
                 PathPurpose::Save(SaveWhat::Export) => "Export the SealedSecret to (written 0600; Tab completes)",
                 PathPurpose::Save(SaveWhat::Yaml) => "Save Secret YAML as (written 0600)",
