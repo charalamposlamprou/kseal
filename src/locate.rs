@@ -163,6 +163,7 @@ pub fn find_manifests(root: &Path, ns: &str, name: &str) -> Vec<Found> {
     found
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // shown paths are full (pretty_path)
 /// `p` relative to `base` when it's under it (shorter to show and type).
 pub fn display_path(p: &Path, base: &Path) -> String {
     let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());

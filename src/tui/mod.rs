@@ -33,6 +33,10 @@ const TICK: Duration = Duration::from_millis(50);
 /// Bound every cluster call, so a hung API server can't leave the UI under a
 /// permanent "Sealing…".
 const CLUSTER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ctrl+S asks the controller about found manifests: short, so a cluster
+/// that is down can't hold the save prompt back for long.
+const OWNER_CHECK_TIMEOUT: Duration = Duration::from_secs(4);
+const OWNER_CHECKS_BUDGET: Duration = Duration::from_secs(8);
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -266,21 +270,27 @@ impl Executor<'_> {
                         .unwrap_or_default();
                 // Whose each match is: can the controller sealed for decrypt it?
                 // (/v1/verify — creates nothing.) With a certificate: unknown.
+                // Bounded: a short timeout per check, an overall budget, and no
+                // more checks after the first failure (the cluster is likely down).
+                let deadline = Instant::now() + OWNER_CHECKS_BUDGET;
+                let mut reachable = ctl.is_some();
                 let mut found = vec![];
                 for h in hits.into_iter().take(10) {
                     let owner = match &ctl {
-                        Some((ctx, cns, cname)) => {
-                            let ok =
-                                timed(async { cluster::verify(&kube.client(ctx).await?, cns, cname, &h.doc).await });
-                            match ok.await {
-                                Ok(true) => locate::Owner::This,
-                                Ok(false) => locate::Owner::Other,
-                                Err(_) => locate::Owner::Unknown,
+                        Some((ctx, cns, cname)) if reachable && Instant::now() < deadline => {
+                            let check = async { cluster::verify(&kube.client(ctx).await?, cns, cname, &h.doc).await };
+                            match tokio::time::timeout(OWNER_CHECK_TIMEOUT, check).await {
+                                Ok(Ok(true)) => locate::Owner::This,
+                                Ok(Ok(false)) => locate::Owner::Other,
+                                _ => {
+                                    reachable = false;
+                                    locate::Owner::Unknown
+                                }
                             }
                         }
-                        None => locate::Owner::Unknown,
+                        _ => locate::Owner::Unknown,
                     };
-                    found.push(locate::FoundManifest { path: locate::display_path(&h.path, &cwd), owner });
+                    found.push(locate::FoundManifest { path: locate::pretty_path(&h.path), owner });
                 }
                 let new_file = locate::new_file_path(&sealed_file, last_dir.as_deref(), root.as_deref());
                 Msg::SaveLocated { tok, new_file, found }

@@ -1352,7 +1352,7 @@ impl App {
                 self.scope = Scope::ALL.into_iter().find(|s| s.as_str() == v).unwrap_or_default();
             }
             PickTarget::SaveTo => {
-                let path = v.strip_prefix(NEW_FILE).unwrap_or(&v).split(OWNER_SEP).next().unwrap_or(&v).to_string();
+                let path = v.split_once(OWNER_SEP).map_or(v.as_str(), |(_, p)| p).to_string();
                 if self.save_found.iter().any(|f| f.path == path && f.owner == Owner::Other) {
                     let msg =
                         format!("{path} belongs to another cluster — its controller can't decrypt what you sealed");
@@ -1816,17 +1816,32 @@ impl App {
                     self.modal = Some(Modal::Path { purpose, input: Input::new(new_file) });
                     return;
                 }
-                let mut items: Vec<String> =
-                    found.iter().map(|f| format!("{}{OWNER_SEP}{}", f.path, f.owner.label())).collect();
-                items.push(format!("{NEW_FILE}{new_file}"));
-                let mine = found.iter().find(|f| f.owner == Owner::This).map(|f| f.path.clone());
-                let current = mine.map(|p| format!("{p}{OWNER_SEP}{}", Owner::This.label())).unwrap_or_default();
-                self.set_status(
-                    format!("{} existing manifest(s) found — pick one, or a new file", found.len()),
-                    Kind::Dim,
-                );
+                let mut items: Vec<String> = found.iter().map(|f| save_item(f.owner.label(), &f.path)).collect();
+                items.push(save_item(NEW_FILE, &new_file));
+                let mine: Vec<String> =
+                    found.iter().filter(|f| f.owner == Owner::This).map(|f| f.path.clone()).collect();
+                // Exactly one of this cluster's: preselect it. Several: don't guess.
+                let mut title = "Save the SealedSecret to".to_string();
+                let current = match mine.as_slice() {
+                    [only] => save_item(Owner::This.label(), only),
+                    [] => String::new(),
+                    many => {
+                        let msg = format!(
+                            "{} files of this cluster define it — choose one (and remove the other)",
+                            many.len()
+                        );
+                        title = format!("Save to — {msg}");
+                        String::new()
+                    }
+                };
+                if mine.len() > 1 {
+                    self.status_for(title.clone(), Kind::Err, WARN_DURATION);
+                } else {
+                    let msg = format!("{} existing manifest(s) found — pick one, or a new file", found.len());
+                    self.set_status(msg, Kind::Dim);
+                }
                 self.save_found = found;
-                let picker = Picker::new("Save the SealedSecret to", items, &current, false);
+                let picker = Picker::new(title, items, &current, false);
                 self.modal = Some(Modal::Picker { target: PickTarget::SaveTo, picker });
             }
             Msg::Written { path, what, skipped, res } => match res {
@@ -2200,10 +2215,16 @@ fn last_line(s: &str) -> String {
     s.trim().lines().last().unwrap_or("").chars().take(120).collect()
 }
 
-/// Between a found manifest's path and whose it is, in the "Save to" picker.
-const OWNER_SEP: &str = "   · ";
-/// Prefix of the "new file" entry of the "Save to" picker.
-const NEW_FILE: &str = "New file: ";
+/// Between whose a found manifest is and its path, in the "Save to" picker.
+const OWNER_SEP: &str = "  · ";
+/// The label of the "new file" entry of the "Save to" picker.
+const NEW_FILE: &str = "new file";
+
+/// A "Save to" entry: whose it is FIRST (padded), so a long path can't push
+/// it off the edge of the picker.
+fn save_item(label: &str, path: &str) -> String {
+    format!("{label:<15}{OWNER_SEP}{path}")
+}
 
 /// Scroll a list of `n` lines shown `page` at a time. Returns whether it moved.
 fn line_scroll(y: &mut u16, k: KeyEvent, page: u16, n: usize) -> bool {
@@ -3011,9 +3032,9 @@ mod tests {
         assert_eq!(
             picker.items,
             vec![
-                "envs/dev/s.yaml   · another cluster",
-                "envs/prod/s.yaml   · this cluster",
-                "New file: ~/repo/sealed-my-secret.yaml"
+                "another cluster  · envs/dev/s.yaml",
+                "this cluster     · envs/prod/s.yaml",
+                "new file         · ~/repo/sealed-my-secret.yaml"
             ]
         );
         assert_eq!(picker.selected, 1, "this cluster's file is preselected");
@@ -3031,6 +3052,20 @@ mod tests {
         app.on_msg(Msg::SaveLocated { tok, new_file: "envs/prod/sealed-my-secret.yaml".into(), found: vec![] });
         let Some(Modal::Path { input, .. }) = &app.modal else { panic!() };
         assert_eq!(input.value(), "envs/prod/sealed-my-secret.yaml");
+        app.modal = None;
+
+        // Two of this cluster's: nothing preselected, and it says so.
+        app.on_key(ctrl('s'));
+        let Some(Effect::LocateSave { tok, .. }) = take(&mut app).pop() else { panic!() };
+        let found = vec![
+            FoundManifest { path: "a.yaml".into(), owner: Owner::This },
+            FoundManifest { path: "b.yaml".into(), owner: Owner::This },
+        ];
+        app.on_msg(Msg::SaveLocated { tok, new_file: "n.yaml".into(), found });
+        let Some(Modal::Picker { picker, .. }) = &app.modal else { panic!() };
+        assert!(picker.title.contains("2 files of this cluster define it"), "{}", picker.title);
+        assert_eq!(picker.selected, 0, "the top of the list, not a guess");
+        assert_eq!(app.status.kind, Kind::Err);
         app.modal = None;
 
         // Picking another cluster's file warns (the y/N overwrite still asks).
