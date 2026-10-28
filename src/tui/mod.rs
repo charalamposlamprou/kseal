@@ -259,8 +259,10 @@ impl Executor<'_> {
                                     .await?
                             }
                         };
-                        let (preview, found) =
-                            blocking(move || gitops_preview(&secret_yaml, &pem, &opts, &repo)).await?;
+                        let (preview, found) = {
+                            let repo = repo.clone();
+                            blocking(move || gitops_preview(&secret_yaml, &pem, &opts, &repo)).await?
+                        };
                         // Whose each found manifest is: can THIS cluster's controller decrypt
                         // it? (/v1/verify — creates nothing). Never asked with a certificate.
                         let mut owned = vec![];
@@ -278,7 +280,7 @@ impl Executor<'_> {
                             };
                             owned.push(gitops::FoundManifest { path, owner });
                         }
-                        blocking(move || Ok(gitops_finish(preview, owned, &out))).await
+                        blocking(move || Ok(gitops_finish(preview, owned, &out, &repo))).await
                     };
                     Msg::GitopsPreviewed { go_gen, res: res.await.map_err(cluster_err(&ctx)) }
                 })
@@ -386,10 +388,16 @@ fn gitops_preview(
 }
 
 /// Pick the output (never another cluster's manifest) and check it.
-fn gitops_finish(mut p: GoPreview, found: Vec<gitops::FoundManifest>, out: &str) -> GoPreview {
+/// A new file goes into the Repo the user named (not wherever kseal was
+/// started); the default name stays relative without one.
+fn gitops_finish(mut p: GoPreview, found: Vec<gitops::FoundManifest>, out: &str, repo: &str) -> GoPreview {
     let Some(yaml) = p.yaml.clone() else { return p };
     let res = format!("SealedSecret {}/{}", p.namespace, p.name);
-    let (out, notes) = gitops::choose_output(&found, out, &p.name, &res);
+    let (mut out, notes) = gitops::choose_output(&found, out, &p.name, &res);
+    let default = gitops::default_file_name(&p.name);
+    if out == default && !repo.is_empty() {
+        out = gitops::pretty_path(&expand_tilde(repo).join(&default));
+    }
     let foreign: Vec<String> =
         found.iter().filter(|f| f.owner == gitops::Owner::Other).map(|f| f.path.clone()).collect();
     let target = expand_tilde(&out);
@@ -475,6 +483,29 @@ fn private_temp_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_export_goes_into_the_chosen_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        let p = || GoPreview {
+            yaml: Some("---\nkind: SealedSecret\n".into()),
+            findings: vec![],
+            name: "db".into(),
+            namespace: "shop".into(),
+            out: String::new(),
+            source_yaml: None,
+            found: vec![],
+        };
+        let r = repo.path().display().to_string();
+        let got = gitops_finish(p(), vec![], "", &r).out;
+        assert_eq!(got, gitops::pretty_path(&repo.path().join("sealed-db.yaml")));
+        assert!(got.ends_with("sealed-db.yaml") && got != "sealed-db.yaml", "{got}");
+        // No Repo: the cwd, as before. A path the user chose: kept.
+        assert_eq!(gitops_finish(p(), vec![], "", "").out, "sealed-db.yaml");
+        assert_eq!(gitops_finish(p(), vec![], "mine.yaml", &r).out, "mine.yaml");
+    }
+
     #[test]
     #[cfg(unix)]
     fn private_temp_dir_is_owner_only() {
