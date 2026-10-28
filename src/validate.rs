@@ -141,6 +141,10 @@ pub fn valid_data_key(s: &str) -> bool {
 pub const TRACKING_ANNOTATIONS: &[&str] = &[core::LAST_APPLIED, "argocd.argoproj.io/tracking-id"];
 pub const TRACKING_LABELS: &[&str] = &["kustomize.toolkit.fluxcd.io/name", "kustomize.toolkit.fluxcd.io/namespace"];
 
+/// The label the sealed-secrets controller puts on its own private sealing
+/// keys — and loads ANY Secret carrying it as one.
+pub const SEALING_KEY_LABEL: &str = "sealedsecrets.bitnami.com/sealed-secrets-key";
+
 /// Secret size limit enforced by the API server (all values together).
 const MAX_SECRET_BYTES: usize = 1024 * 1024;
 
@@ -254,7 +258,8 @@ pub fn secret_findings(doc: &Value) -> Vec<Finding> {
     }
 
     let type_ = m.get("type").and_then(Value::as_str).unwrap_or("Opaque");
-    if !core::SECRET_TYPES.contains(&type_) {
+    owned_secret_findings(doc, type_, &res, &mut out);
+    if !core::SECRET_TYPES.contains(&type_) && type_ != HELM_RELEASE {
         out.push(Finding::new(
             Severity::Info,
             "secret.custom-type",
@@ -375,6 +380,45 @@ pub fn secret_findings(doc: &Value) -> Vec<Finding> {
     out
 }
 
+const HELM_RELEASE: &str = "helm.sh/release.v1";
+
+/// Secrets the cluster or a controller owns, which don't belong in Git —
+/// sealed or not. Typically picked by mistake when loading from a cluster.
+fn owned_secret_findings(doc: &Value, type_: &str, res: &str, out: &mut Vec<Finding>) {
+    if obj_at(doc, &["metadata", "labels"]).is_some_and(|l| l.contains_key(SEALING_KEY_LABEL)) {
+        out.push(
+            Finding::new(
+                Severity::Critical,
+                "secret.sealing-key",
+                res,
+                "this is the sealed-secrets controller's own private sealing key",
+            )
+            .key(SEALING_KEY_LABEL)
+            .fix(
+                "Never put it in Git, sealed or not: it decrypts every SealedSecret, and sealed with itself it can't \
+                 be recovered. Back it up offline instead",
+            ),
+        );
+    }
+    if type_ == HELM_RELEASE {
+        out.push(
+            Finding::new(Severity::High, "secret.helm-release", res, "this is Helm's release record, not app config")
+                .fix("Leave it to Helm — export the Secret your chart's values come from instead"),
+        );
+    }
+    if type_ == "kubernetes.io/service-account-token" {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "secret.sa-token",
+                res,
+                "a ServiceAccount token minted by this cluster — only valid there",
+            )
+            .fix("Commit the ServiceAccount (and an empty token Secret) and let the cluster mint the token"),
+        );
+    }
+}
+
 fn tls_cert_findings(pem: &str, res: &str, out: &mut Vec<Finding>) {
     let parsed = x509_parser::pem::parse_x509_pem(pem.as_bytes());
     let Ok((_, pem)) = parsed else {
@@ -488,6 +532,19 @@ pub fn sealed_findings(doc: &Value, key: Option<KeyInfo>) -> Vec<Finding> {
                 );
             }
         }
+    }
+
+    if obj_at(doc, &["spec", "template", "metadata", "labels"]).is_some_and(|l| l.contains_key(SEALING_KEY_LABEL)) {
+        out.push(
+            Finding::new(
+                Severity::Critical,
+                "sealed.sealing-key",
+                &res,
+                "unseals into a Secret labelled as a sealing key — the controller would load it as one",
+            )
+            .key(SEALING_KEY_LABEL)
+            .fix("Don't commit sealing keys; remove the label if this isn't one"),
+        );
     }
 
     // Plaintext exposure.
@@ -1001,7 +1058,27 @@ mod tests {
         let custom = secret(json!({"type": "example.com/thing"}));
         assert_eq!(secret_findings(&custom)[0].severity, Severity::Info);
         let sa = secret(json!({"type": "kubernetes.io/service-account-token"}));
-        assert_eq!(rules(&secret_findings(&sa)), vec!["secret.type-keys"]);
+        assert_eq!(rules(&secret_findings(&sa)), vec!["secret.sa-token", "secret.type-keys"]);
+    }
+
+    #[test]
+    fn cluster_owned_secrets_are_flagged() {
+        let key = secret(json!({"type": "kubernetes.io/tls", "stringData": {"tls.crt": "x", "tls.key": "y"},
+            "metadata": {"name": "sealed-secrets-keyv9tkg", "namespace": "kube-system", "labels": {SEALING_KEY_LABEL: "active"}}}));
+        let f = secret_findings(&key);
+        assert_eq!((f[0].rule, f[0].severity), ("secret.sealing-key", Severity::Critical));
+        let sealed =
+            crate::seal::seal_secret(&key, &crate::seal::tests::test_key().to_public_key(), Scope::Strict).unwrap();
+        assert!(
+            sealed_findings(&sealed, None)
+                .iter()
+                .any(|f| f.rule == "sealed.sealing-key" && f.severity == Severity::Critical)
+        );
+        let helm = secret(json!({"type": "helm.sh/release.v1", "stringData": {"release": "H4sI"}}));
+        assert_eq!(rules(&secret_findings(&helm)), vec!["secret.helm-release"], "no custom-type noise for Helm");
+        let sa = secret(json!({"type": "kubernetes.io/service-account-token",
+            "metadata": {"name": "t", "namespace": "prod", "annotations": {"kubernetes.io/service-account.name": "app"}}}));
+        assert_eq!(rules(&secret_findings(&sa)), vec!["secret.sa-token"]);
     }
 
     #[test]

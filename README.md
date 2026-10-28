@@ -108,7 +108,10 @@ never shows a value. The checks:
   that isn't base64, keys missing for a built-in type (`kubernetes.io/tls`
   without `tls.key`, …), invalid `.dockerconfigjson`, an expired `tls.crt`, the
   1 MiB size limit, a key in both `data` and `stringData`, a single-line value
-  ending in a newline, and a last-applied snapshot.
+  ending in a newline, and a last-applied snapshot. Cluster-owned Secrets that
+  don't belong in Git are flagged too: the sealed-secrets controller's own
+  sealing key (Critical, blocks export), Helm release records and
+  ServiceAccount tokens.
 - **SealedSecrets:** apiVersion, identity, scope annotations (conflicting,
   missing namespace, cluster-wide exposure), a template name or namespace that
   differs from the SealedSecret's, unencrypted `spec.template.data`, a

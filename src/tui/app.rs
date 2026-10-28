@@ -616,6 +616,9 @@ pub struct App {
     pub go_ns: Input,
     pub workflow: Workflow,
     pub go_out: Input,
+    /// The output path is kseal's default (never typed): it follows the
+    /// Secret being previewed.
+    go_out_auto: bool,
     pub go_preview: Option<GoPreview>,
     pub go_busy: bool,
     pub go_scroll: Scroll,
@@ -698,6 +701,7 @@ impl App {
             go_ns: Input::default(),
             workflow: Workflow::default(),
             go_out: Input::default(),
+            go_out_auto: true,
             go_preview: None,
             go_busy: false,
             go_scroll: Scroll::default(),
@@ -1937,6 +1941,8 @@ impl App {
     /// The output path changed: the target checks in the preview were for
     /// the old one (export re-checks the new one before writing).
     fn go_out_edited(&mut self) {
+        // Typed by the user: theirs from now on (cleared: kseal's again).
+        self.go_out_auto = self.go_out.value().trim().is_empty();
         self.go_exported = None;
         if let Some(p) = &mut self.go_preview {
             p.findings.retain(|f| !f.rule.starts_with("target.") && !f.rule.starts_with("kustomize."));
@@ -2023,7 +2029,8 @@ impl App {
             ctx: self.seal_ctx.clone(),
             cert,
             ctl,
-            out: self.go_out.value().trim().to_string(),
+            // The default is recomputed for the Secret actually previewed.
+            out: if self.go_out_auto { String::new() } else { self.go_out.value().trim().to_string() },
         });
     }
 
@@ -2041,8 +2048,9 @@ impl App {
             }
             Ok(p) => p,
         };
-        if self.go_out.value().trim().is_empty() && !p.out.is_empty() {
+        if (self.go_out_auto || self.go_out.value().trim().is_empty()) && !p.out.is_empty() {
             self.go_out.set(p.out.clone());
+            self.go_out_auto = true;
         }
         let summary = crate::validate::summary(&p.findings);
         let worst = crate::validate::worst(&p.findings);
@@ -3492,6 +3500,41 @@ mod tests {
         app.on_msg(Msg::Written { path, what: SaveWhat::Export, skipped, res: Ok(()) });
         assert_eq!(app.go_exported.as_deref(), Some("sealed-my-secret.yaml"));
         assert!(app.status.msg.contains("never commits, pushes or applies"), "{}", app.status.msg);
+    }
+
+    #[test]
+    fn gitops_default_output_follows_the_secret_until_typed() {
+        let mut app = previewed(vec![]);
+        assert_eq!(app.go_out.value(), "sealed-my-secret.yaml");
+        let land = |app: &mut App, name: &str| {
+            app.picked(PickTarget::Workflow, "Argo CD".into());
+            app.on_key(ctrl('e'));
+            let Some(Effect::GitopsPreview { go_gen, out, .. }) = take(app).pop() else { panic!() };
+            let p = GoPreview {
+                yaml: Some("y".into()),
+                findings: vec![],
+                name: name.into(),
+                namespace: "ns".into(),
+                out: if out.is_empty() { gitops::default_file_name(name) } else { out.clone() },
+            };
+            app.on_msg(Msg::GitopsPreviewed { go_gen, res: Ok(p) });
+            out
+        };
+        // Another Secret: the default follows it instead of keeping the old name.
+        assert_eq!(land(&mut app, "api"), "", "the executor picks the default");
+        assert_eq!(app.go_out.value(), "sealed-api.yaml");
+        // Typed by the user: kept.
+        app.tab = Tab::GitOps;
+        app.set_focus(Focus::GoOut);
+        app.on_key(ctrl('k'));
+        app.on_paste("repo/apps/db.yaml".into());
+        assert_eq!(land(&mut app, "other"), "repo/apps/db.yaml");
+        assert_eq!(app.go_out.value(), "repo/apps/db.yaml");
+        // Cleared: the default again.
+        app.set_focus(Focus::GoOut);
+        app.on_key(ctrl('k'));
+        assert_eq!(land(&mut app, "third"), "");
+        assert_eq!(app.go_out.value(), "sealed-third.yaml");
     }
 
     #[test]
