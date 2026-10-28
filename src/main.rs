@@ -149,8 +149,10 @@ fn arg_or_stdin(v: Option<String>) -> Result<String> {
 fn emit(out: &OutArgs, content: &str) -> Result<()> {
     match &out.output {
         Some(p) => {
+            // Overwriting stays allowed (scripts re-run `-o`), but is never silent.
+            let existed = p.exists();
             core::write_secret_file(p, content).with_context(|| format!("writing {}", p.display()))?;
-            eprintln!("wrote {}", p.display());
+            eprintln!("{} {}", if existed { "replaced" } else { "wrote" }, p.display());
         }
         None => std::io::stdout().write_all(content.as_bytes())?,
     }
