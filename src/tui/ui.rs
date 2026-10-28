@@ -12,6 +12,7 @@ use super::app::{App, Focus, Kind, Modal, PathPurpose, PickTarget, SaveWhat, Tab
 use super::widgets::{Input, centered, one_line};
 use crate::cluster::LOGIN_FAILED;
 use crate::core::EntryKind;
+use crate::diff::{self, Tag};
 
 struct Theme {
     bg: Color,
@@ -28,6 +29,8 @@ struct Theme {
     border: Color,
     row_a: Color,
     row_b: Color,
+    warn: Color,
+    note: Color,
 }
 
 /// Terminals that don't advertise truecolor get the nearest xterm-256 colour,
@@ -88,6 +91,8 @@ fn theme() -> &'static Theme {
             border: c(0x3c3c3c),
             row_a: c(0x232323),
             row_b: c(0x2a2a2a),
+            warn: c(0xce9178),
+            note: c(0xdcdcaa),
         }
     })
 }
@@ -133,6 +138,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_footer(f, footer, app);
 
     if let Some(m) = &app.modal {
+        if matches!(m, Modal::Diff { .. }) {
+            // The diff popup's inner height (margin + border), for paging.
+            app.view.modal_h = area.height.saturating_sub(4);
+        }
         cur = draw_modal(f, area, m);
     }
     if let Some(p) = cur {
@@ -470,10 +479,13 @@ fn draw_seal(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Position
     };
     let seal_blk = app.seal_blocked();
     let val_blk = app.validate_blocked();
+    let diff_blk = (!app.sealed_ok).then_some("seal first");
     let mut spans = vec![
         button("Ctrl+E  Seal →", seal_blk, true),
         Span::raw("  "),
         button("Ctrl+T  Validate", val_blk, false),
+        Span::raw("  "),
+        button("Ctrl+D  Diff", diff_blk, false),
         Span::raw("   "),
     ];
     let note = match (seal_blk, val_blk) {
@@ -487,7 +499,7 @@ fn draw_seal(f: &mut Frame, area: Rect, app: &mut App, cur: &mut Option<Position
         Some(with) => format!("SealedSecret — sealed with {with}"),
         None => "SealedSecret".into(),
     };
-    let blk = pane_block(&title, "Ctrl+Y copy · Ctrl+S save", fo == Focus::Sealed);
+    let blk = pane_block(&title, "Ctrl+D diff · Ctrl+Y copy · Ctrl+S save", fo == Focus::Sealed);
     app.view.sealed_h = blk.inner(out).height;
     let text = if app.sealed_out.is_empty() {
         Text::styled(
@@ -509,6 +521,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Some(Modal::Path { .. }) => "Tab complete · Enter OK · Esc cancel",
         Some(Modal::RowEdit { .. }) => "Tab key/value · Enter save · Ctrl+X show · Esc cancel",
         Some(Modal::Overwrite { .. }) => "y overwrite · any other key cancels",
+        Some(Modal::Diff { .. }) => "↑↓ PgUp PgDn scroll · n/N next/prev change · Ctrl+X reveal values · Esc close",
         Some(Modal::Help) => "any key closes",
         Some(Modal::Error { ref detail, .. }) if detail.starts_with(LOGIN_FAILED) => {
             "Ctrl+R retry · Ctrl+Y copy the error · any other key closes"
@@ -521,7 +534,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 "Enter pick · Ctrl+L load from cluster · Ctrl+R reload contexts"
             }
             Focus::SecType => "Enter pick (or type a custom type) · Ctrl+G generate",
-            Focus::SealCtx | Focus::Scope => "Enter pick · Ctrl+E seal · Ctrl+T validate",
+            Focus::SealCtx | Focus::Scope => "Enter pick · Ctrl+E seal · Ctrl+T validate · Ctrl+D diff",
             Focus::Rows => {
                 "a add · d delete · Enter edit · e $EDITOR · v/V show · Ctrl+Y copy value · Ctrl+K clear all"
             }
@@ -548,9 +561,42 @@ fn modal_block(title: &str) -> Block<'_> {
         .style(Style::new().bg(t.bg2).fg(t.fg))
 }
 
+/// One diff line, coloured by what happened to it.
+fn diff_line(l: &diff::Line, reveal: bool) -> Line<'static> {
+    let t = theme();
+    let text = one_line(&diff::render(l, reveal));
+    let color = match l.tag {
+        Tag::Header => t.accent,
+        Tag::Same | Tag::Note => t.dim,
+        Tag::Added => t.ok,
+        Tag::Removed => t.err,
+        Tag::Changed => t.note,
+        Tag::Unknown => t.warn,
+    };
+    let split = text.char_indices().nth(2 + l.field.chars().count()).map_or(text.len(), |(i, _)| i);
+    let (head, rest) = text.split_at(split);
+    let head_style =
+        if l.tag == Tag::Header || l.tag.is_change() { Style::new().fg(color).bold() } else { Style::new().fg(color) };
+    let rest_style = if l.tag == Tag::Same { Style::new().fg(t.dim) } else { Style::new().fg(t.blue) };
+    Line::from(vec![Span::styled(head.to_string(), head_style), Span::styled(rest.to_string(), rest_style)])
+}
+
 fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
     let t = theme();
     match m {
+        Modal::Diff { title, diff, scroll, reveal } => {
+            let r = area.inner(Margin { horizontal: 2, vertical: 1 });
+            f.render_widget(Clear, r);
+            let mut title = format!("{title} — {}", diff.summary);
+            if *reveal {
+                title.push_str(" — VALUES REVEALED");
+            }
+            let blk = modal_block(&title);
+            let blk = if *reveal { blk.border_style(Style::new().fg(t.err)) } else { blk };
+            let lines: Vec<Line> = diff.lines.iter().map(|l| diff_line(l, *reveal)).collect();
+            f.render_widget(Paragraph::new(lines).block(blk).scroll((*scroll, 0)), r);
+            None
+        }
         Modal::Picker { target, picker } => {
             let vis = picker.visible();
             let h = (vis.len() as u16 + 4).clamp(6, area.height.saturating_sub(4).max(6));
@@ -587,6 +633,7 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 PathPurpose::Open(Tab::Encode) => "Open .env or Secret YAML",
                 PathPurpose::Open(Tab::Decode) => "Open Secret YAML",
                 PathPurpose::Open(Tab::Seal) => "Sealing certificate (PEM)",
+                PathPurpose::DiffSealed => "Compare with a file — or leave it empty for the live Secret (read-only)",
                 PathPurpose::Save(SaveWhat::Yaml) => "Save Secret YAML as (written 0600)",
                 PathPurpose::Save(SaveWhat::Sealed) => "Save SealedSecret as (written 0600)",
             };
@@ -667,6 +714,7 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 k("Ctrl+O", "open file: .env or Secret YAML (Seal tab: certificate)"),
                 k("Ctrl+L", "load the selected Secret from the cluster (read-only)"),
                 k("Ctrl+E / Ctrl+T", "seal / validate with the controller"),
+                k("Ctrl+D", "Seal tab: diff the output with a file, or (empty) the live Secret"),
                 k("Ctrl+Y", "copy whatever is focused"),
                 k("Ctrl+S", "save the YAML / SealedSecret (0600)"),
                 k("Ctrl+K", "clear the focused thing"),
@@ -684,6 +732,10 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 h("Pickers and panes"),
                 k("Enter", "open a picker (type to filter)"),
                 k("↑↓ ←→", "scroll a YAML pane"),
+                Line::raw(""),
+                h("Diff viewer"),
+                k("n / N", "next / previous change"),
+                k("Ctrl+X", "reveal values (masked by default)"),
                 Line::raw(""),
                 Line::styled(
                     "kseal only reads from the cluster: it never creates, patches or deletes anything.",
@@ -750,6 +802,26 @@ mod tests {
         app.modal = Some(Modal::Error { title: "Load failed".into(), detail: "\x1b[31mred\x07".into() });
         let s = render(&mut app, 120, 40);
         assert!(s.contains("�[31mred�") && !s.contains('\x1b'));
+    }
+
+    #[test]
+    fn diff_popup_renders_masked_until_revealed() {
+        let mut app = App::new();
+        app.tab = Tab::Seal;
+        let old = "kind: Secret\nmetadata: {name: db, namespace: prod}\nstringData: {P: dummy-one}\n";
+        let new = "kind: Secret\nmetadata: {name: db, namespace: prod}\nstringData: {P: dummy-two}\n";
+        let d = crate::diff::diff_texts(old, new).unwrap();
+        app.modal = Some(Modal::Diff { title: "t".into(), diff: d.clone(), scroll: 0, reveal: false });
+        for (w, h) in [(60, 20), (20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+        let s = render(&mut app, 160, 45);
+        assert!(s.contains("~ data.P") && !s.contains("dummy-one") && !s.contains("dummy-two"), "{s}");
+        app.modal = Some(Modal::Diff { title: "t".into(), diff: d, scroll: 0, reveal: true });
+        let s = render(&mut app, 160, 45);
+        assert!(s.contains("dummy-one") && s.contains("VALUES REVEALED"));
+        app.modal = None;
+        assert!(render(&mut app, 160, 45).contains("Ctrl+D  Diff"), "the F3 button");
     }
 
     #[test]

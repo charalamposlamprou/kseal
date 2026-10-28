@@ -146,6 +146,15 @@ pub async fn get_secret(client: &Client, ns: &str, name: &str) -> Result<Value> 
     Ok(v)
 }
 
+/// [`get_secret`], or `None` when it doesn't exist (read-only).
+pub async fn get_secret_opt(client: &Client, ns: &str, name: &str) -> Result<Option<Value>> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), ns);
+    if api.get_metadata_opt(name).await.with_context(|| format!("getting secret {ns}/{name}"))?.is_none() {
+        return Ok(None);
+    }
+    get_secret(client, ns, name).await.map(Some)
+}
+
 /// Find the sealed-secrets controller service: `(namespace, name)`.
 ///
 /// Lists services cluster-wide (preferring the canonical name); if that's

@@ -31,6 +31,7 @@ use serde_json::Value;
 use super::widgets::{Input, Picker, complete_path};
 use crate::cluster::Contexts;
 use crate::core::{self, Carryover, Entry, EntryKind, FileKind, Pairs};
+use crate::diff;
 use crate::seal::Scope;
 
 pub const STATUS_DURATION: Duration = Duration::from_millis(4000);
@@ -200,6 +201,9 @@ pub enum PathPurpose {
     /// the table; Seal: the offline certificate.
     Open(Tab),
     Save(SaveWhat),
+    /// A local manifest to compare the sealed output with (empty = the
+    /// live Secret).
+    DiffSealed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,16 +216,44 @@ pub enum SaveWhat {
 pub enum ReadPurpose {
     Editor,
     Decode,
+    Diff,
 }
 
 #[derive(Debug)]
 pub enum Modal {
-    Picker { target: PickTarget, picker: Picker },
-    Path { purpose: PathPurpose, input: Input },
-    RowEdit { idx: Option<usize>, key: Input, value: Input, on_value: bool, shown: bool },
-    Overwrite { path: String, content: String, what: SaveWhat, skipped: usize },
+    Picker {
+        target: PickTarget,
+        picker: Picker,
+    },
+    Path {
+        purpose: PathPurpose,
+        input: Input,
+    },
+    RowEdit {
+        idx: Option<usize>,
+        key: Input,
+        value: Input,
+        on_value: bool,
+        shown: bool,
+    },
+    Overwrite {
+        path: String,
+        content: String,
+        what: SaveWhat,
+        skipped: usize,
+    },
+    /// A semantic diff of the sealed output against a file or the live Secret.
+    Diff {
+        title: String,
+        diff: diff::Diff,
+        scroll: u16,
+        reveal: bool,
+    },
     Help,
-    Error { title: String, detail: String },
+    Error {
+        title: String,
+        detail: String,
+    },
 }
 
 /// Side effects for the event loop to run. Results come back as [`Msg`]s.
@@ -296,6 +328,13 @@ pub enum Effect {
         kv_gen: u64,
     },
     ClearClients,
+    /// Read one Secret from the cluster (read-only) to diff against.
+    FetchLive {
+        tok: Tok,
+        ctx: String,
+        ns: String,
+        name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -372,6 +411,12 @@ pub enum Msg {
         kv_gen: u64,
         res: Result<String, String>,
     },
+    /// `Ok(None)`: no such Secret in the cluster.
+    LiveFetched {
+        tok: Tok,
+        label: String,
+        res: Result<Option<String>, String>,
+    },
 }
 
 /// Heights of the scrollable areas from the last draw (for paging/clamping).
@@ -381,6 +426,7 @@ pub struct View {
     pub dec_h: u16,
     pub yaml_h: u16,
     pub sealed_h: u16,
+    pub modal_h: u16,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -818,6 +864,7 @@ impl App {
                 'e' => self.do_seal(),
                 't' => self.do_validate(),
                 'x' => self.toggle_show(),
+                'd' => self.diff_prompt(),
                 _ => self.field_key(k),
             },
             _ => self.field_key(k),
@@ -1110,7 +1157,9 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let path = input.value().trim().to_string();
-                    if path.is_empty() {
+                    if path.is_empty() && purpose == PathPurpose::DiffSealed {
+                        self.diff_live();
+                    } else if path.is_empty() {
                         self.modal = Some(Modal::Path { purpose, input });
                     } else {
                         self.path_chosen(purpose, path);
@@ -1147,6 +1196,37 @@ impl App {
                 } else {
                     self.set_status("Save cancelled", Kind::Dim);
                 }
+            }
+            Modal::Diff { title, diff, mut scroll, mut reveal } => {
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return,
+                    KeyCode::Char('x') if ctrl => {
+                        reveal = !reveal;
+                        if reveal {
+                            self.status_for("Values revealed — Ctrl+X masks them again", Kind::Err, WARN_DURATION);
+                        } else {
+                            self.set_status("Values masked", Kind::Dim);
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        let changes: Vec<usize> =
+                            diff.lines.iter().enumerate().filter(|(_, l)| l.tag.is_change()).map(|(i, _)| i).collect();
+                        let cur = scroll as usize;
+                        let next = if k.code == KeyCode::Char('n') {
+                            changes.iter().find(|&&i| i > cur).or(changes.first())
+                        } else {
+                            changes.iter().rev().find(|&&i| i < cur).or(changes.last())
+                        };
+                        match next {
+                            Some(&i) => scroll = i as u16,
+                            None => self.set_status("No changes", Kind::Dim),
+                        }
+                    }
+                    _ => {
+                        line_scroll(&mut scroll, k, self.view.modal_h, diff.lines.len());
+                    }
+                }
+                self.modal = Some(Modal::Diff { title, diff, scroll, reveal });
             }
         }
     }
@@ -1291,6 +1371,16 @@ impl App {
                 self.effects.push(Effect::ReadFile {
                     tok,
                     purpose,
+                    path,
+                    out_gen: self.out_gen,
+                    kv_gen: self.kv_edit_gen,
+                });
+            }
+            PathPurpose::DiffSealed => {
+                let tok = self.claim("diff-read");
+                self.effects.push(Effect::ReadFile {
+                    tok,
+                    purpose: ReadPurpose::Diff,
                     path,
                     out_gen: self.out_gen,
                     kv_gen: self.kv_edit_gen,
@@ -1548,6 +1638,59 @@ impl App {
         });
     }
 
+    // ------------------------------------------------------------ diff
+
+    /// Ctrl+D: compare the Seal tab's output with a local Secret /
+    /// SealedSecret file, or (empty path) the live Secret it would replace.
+    fn diff_prompt(&mut self) {
+        if self.tab != Tab::Seal {
+            self.set_status("Ctrl+D compares the Seal tab's output (F3) with a file or the live Secret", Kind::Dim);
+            return;
+        }
+        if !self.sealed_ok {
+            self.set_status("Seal a secret first", Kind::Err);
+            return;
+        }
+        self.modal = Some(Modal::Path { purpose: PathPurpose::DiffSealed, input: Input::default() });
+    }
+
+    /// The live Secret the sealed output becomes — in the context it was
+    /// sealed for, read-only.
+    fn diff_live(&mut self) {
+        let ctx = match &self.sealed_with {
+            Some(SealedWith::Controller { ctx, .. }) => ctx.clone(),
+            _ => self.seal_ctx.clone(),
+        };
+        let docs = core::parse_yaml_docs(&self.sealed_out).unwrap_or_default();
+        let (name, ns, _) = docs.first().map(core::secret_identity).unwrap_or_default();
+        if ctx.is_empty() || ns.is_empty() || name.is_empty() {
+            self.set_status("No context / namespace / name to look the live Secret up with", Kind::Err);
+            return;
+        }
+        let tok = self.claim("diff-read");
+        self.set_status(format!("Reading {ns}/{name} from {ctx} (read-only)…"), Kind::Dim);
+        self.effects.push(Effect::FetchLive { tok, ctx, ns, name });
+    }
+
+    /// Show the diff of `text` (old: a file, or the live Secret) against the
+    /// sealed output. kseal still holds the YAML it sealed, so the new
+    /// side's values are known (masked until Ctrl+X).
+    fn show_diff(&mut self, old_label: &str, text: &str) {
+        if !self.sealed_ok {
+            self.set_status("The sealed output is gone — seal again", Kind::Err);
+            return;
+        }
+        let source = Some(self.yaml_out.as_str()).filter(|y| !y.trim().is_empty());
+        match diff::diff_texts_from(text, &self.sealed_out, source) {
+            Ok(d) => {
+                self.set_status(format!("{old_label} → sealed output: {}", d.summary), Kind::Dim);
+                let title = format!("{old_label} → sealed output");
+                self.modal = Some(Modal::Diff { title, diff: d, scroll: 0, reveal: false });
+            }
+            Err(e) => self.report_error("Can't compare", format!("{e:#}")),
+        }
+    }
+
     // ------------------------------------------------------------ results
 
     pub fn on_msg(&mut self, m: Msg) {
@@ -1712,6 +1855,16 @@ impl App {
                     self.copied("terminal (OSC 52)", skipped);
                 }
             },
+            Msg::LiveFetched { tok, label, res } => {
+                if !self.is_latest("diff-read", tok) {
+                    return;
+                }
+                match res {
+                    Err(e) => self.report_error("Reading the live Secret failed", e),
+                    Ok(Some(json)) => self.show_diff(&label, &json),
+                    Ok(None) => self.show_diff(&format!("{label} (not in the cluster)"), ""),
+                }
+            }
             Msg::Edited { row, key, original, kv_gen, res } => {
                 let edited = match res {
                     Ok(s) => core::editor_result(&original, s),
@@ -1849,7 +2002,11 @@ impl App {
         kv_gen: u64,
         res: Result<String, String>,
     ) {
-        let key = if purpose == ReadPurpose::Editor { "editor-read" } else { "decode-read" };
+        let key = match purpose {
+            ReadPurpose::Editor => "editor-read",
+            ReadPurpose::Decode => "decode-read",
+            ReadPurpose::Diff => "diff-read",
+        };
         if !self.is_latest(key, tok) {
             return; // superseded by a newer pick
         }
@@ -1860,6 +2017,10 @@ impl App {
             }
             Ok(t) => t,
         };
+        if purpose == ReadPurpose::Diff {
+            self.show_diff(&basename(&path), &text);
+            return;
+        }
         if purpose == ReadPurpose::Decode {
             self.populate_decode(&path, &text);
             return;
@@ -1950,6 +2111,23 @@ pub fn basename(path: &str) -> String {
 
 fn last_line(s: &str) -> String {
     s.trim().lines().last().unwrap_or("").chars().take(120).collect()
+}
+
+/// Scroll a list of `n` lines shown `page` at a time. Returns whether it moved.
+fn line_scroll(y: &mut u16, k: KeyEvent, page: u16, n: usize) -> bool {
+    let before = *y;
+    let page = page.max(1);
+    let max = (n as u16).saturating_sub(page);
+    match k.code {
+        KeyCode::Up | KeyCode::Char('k') => *y = y.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => *y = (*y + 1).min(max),
+        KeyCode::PageUp => *y = y.saturating_sub(page),
+        KeyCode::PageDown | KeyCode::Char(' ') => *y = (*y + page).min(max),
+        KeyCode::Home | KeyCode::Char('g') => *y = 0,
+        KeyCode::End | KeyCode::Char('G') => *y = max,
+        _ => {}
+    }
+    *y != before
 }
 
 /// Move the table selection. Returns whether it moved.
@@ -2654,5 +2832,66 @@ mod tests {
         app.on_msg(Msg::Validated { out_gen, res: Ok(true) });
         assert_eq!(app.status.kind, Kind::Ok, "{}", app.status.msg);
         assert!(app.status.msg.contains("in prod can decrypt"), "{}", app.status.msg);
+    }
+
+    /// A real seal of the Encode tab's YAML on the Seal tab (context prod-a).
+    fn sealed_for_real(app: &mut App, env: &str) {
+        open_file(app, "a.env", env);
+        seal_on(app, "prod-a");
+        app.on_key(ctrl('e'));
+        let Some(Effect::Seal { out_gen, yaml, scope, .. }) = take(app).pop() else { panic!() };
+        let pk = crate::seal::tests::test_key().to_public_key();
+        app.on_msg(Msg::Sealed { out_gen, res: Ok(crate::seal::seal_yaml(&yaml, &pk, scope).unwrap().0) });
+        assert!(app.sealed_ok);
+    }
+
+    #[test]
+    fn ctrl_d_on_the_seal_tab_diffs_with_a_file_or_the_live_secret() {
+        let mut app = connected();
+        // Other tabs and an unsealed Seal tab say what to do.
+        app.on_key(ctrl('d'));
+        assert!(app.modal.is_none() && app.status.msg.contains("Seal tab"));
+        app.tab = Tab::Seal;
+        app.on_key(ctrl('d'));
+        assert!(app.modal.is_none() && app.status.msg.contains("Seal a secret first"));
+
+        sealed_for_real(&mut app, "PASSWORD=dummy-new\nUSER=alice\n");
+        // A file: its path, read, diffed.
+        app.on_key(ctrl('d'));
+        assert!(matches!(&app.modal, Some(Modal::Path { purpose: PathPurpose::DiffSealed, .. })));
+        app.on_paste("old.yaml".into());
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::ReadFile { tok, purpose, path, out_gen, kv_gen }) = take(&mut app).pop() else { panic!() };
+        let old = "kind: Secret\nmetadata: {name: my-secret, namespace: default}\nstringData: {PASSWORD: dummy-old, USER: alice}\n";
+        app.on_msg(Msg::FileRead { tok, purpose, path, out_gen, kv_gen, res: Ok(old.into()) });
+        let Some(Modal::Diff { diff, title, reveal: false, .. }) = &app.modal else { panic!("no diff") };
+        assert_eq!(title, "old.yaml → sealed output");
+        assert_eq!((diff.summary.changed, diff.summary.unknown), (1, 0), "plain vs what was sealed: really compared");
+        let masked: String = diff.lines.iter().map(|l| diff::render(l, false)).collect();
+        assert!(!masked.contains("dummy-"), "masked until Ctrl+X");
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(ctrl('x'));
+        let Some(Modal::Diff { diff, reveal: true, .. }) = &app.modal else { panic!() };
+        let shown: String = diff.lines.iter().map(|l| diff::render(l, true)).collect();
+        assert!(shown.contains("\"dummy-old\" → \"dummy-new\""), "{shown}");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+
+        // Empty path: the live Secret, in the context it was sealed for.
+        app.on_key(ctrl('d'));
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::FetchLive { tok, ctx, ns, name }) = take(&mut app).pop() else { panic!("no live fetch") };
+        assert_eq!((ctx.as_str(), ns.as_str(), name.as_str()), ("prod-a", "default", "my-secret"));
+        app.on_msg(Msg::LiveFetched { tok, label: "live".into(), res: Ok(None) });
+        let Some(Modal::Diff { diff, .. }) = &app.modal else { panic!("no diff") };
+        assert_eq!(diff.lines[0].tag, diff::Tag::Added, "not in the cluster yet: all new");
+        // Malformed YAML: a clear error.
+        app.modal = None;
+        app.on_key(ctrl('d'));
+        app.on_paste("bad.yaml".into());
+        app.on_key(key(KeyCode::Enter));
+        let Some(Effect::ReadFile { tok, purpose, path, out_gen, kv_gen }) = take(&mut app).pop() else { panic!() };
+        app.on_msg(Msg::FileRead { tok, purpose, path, out_gen, kv_gen, res: Ok("a: [".into()) });
+        assert!(matches!(&app.modal, Some(Modal::Error { detail, .. }) if detail.starts_with("old: malformed YAML")));
     }
 }

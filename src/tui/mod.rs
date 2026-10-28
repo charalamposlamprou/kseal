@@ -255,6 +255,13 @@ impl Executor<'_> {
                 app.on_msg(Msg::Edited { row, key, original: value, kv_gen, res });
             }
             Effect::ClearClients => kube.clear(),
+            Effect::FetchLive { tok, ctx, ns, name } => self.spawn(async move {
+                let res = timed(async { cluster::get_secret_opt(&kube.client(&ctx).await?, &ns, &name).await }).await;
+                let res = res
+                    .and_then(|v| v.map(|v| serde_json::to_string(&v).map_err(anyhow::Error::from)).transpose())
+                    .map_err(cluster_err(&ctx));
+                Msg::LiveFetched { tok, label: format!("live {ns}/{name} in {ctx}"), res }
+            }),
         }
         Ok(())
     }
