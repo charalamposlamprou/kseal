@@ -253,6 +253,21 @@ fn key_button(f: &mut Frame, area: Rect, label: &str, active: bool) {
     f.render_widget(Paragraph::new(label.to_string()).style(style).centered(), area);
 }
 
+/// Fit `s` in `w` columns by shortening the path AFTER " · " from the
+/// left ("label  · …/envs/prod/db.yaml"): the label and the file name, the
+/// parts that matter, always stay visible.
+fn keep_tail(s: &str, w: usize) -> String {
+    if s.chars().count() <= w {
+        return s.to_string();
+    }
+    let Some((head, path)) = s.split_once(" · ") else { return truncate(s, w) };
+    let head = format!("{head} · ");
+    let keep = w.saturating_sub(head.chars().count() + 1);
+    let n = path.chars().count();
+    let tail: String = path.chars().skip(n.saturating_sub(keep)).collect();
+    format!("{head}…{tail}")
+}
+
 fn truncate(s: &str, w: usize) -> String {
     let s = one_line(s);
     if s.chars().count() <= w {
@@ -600,7 +615,10 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
         Modal::Picker { target, picker } => {
             let vis = picker.visible();
             let h = (vis.len() as u16 + 4).clamp(6, area.height.saturating_sub(4).max(6));
-            let r = centered(area, 64.min(area.width.saturating_sub(4)), h);
+            // "Save to" lists full paths: as wide as the screen allows.
+            let save_to = *target == PickTarget::SaveTo;
+            let w = if save_to { area.width.saturating_sub(8).max(64) } else { 64 };
+            let r = centered(area, w.min(area.width.saturating_sub(4)), h);
             f.render_widget(Clear, r);
             let blk = modal_block(&picker.title);
             let inner = blk.inner(r);
@@ -612,7 +630,12 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
                 Paragraph::new(Line::from(vec![Span::styled("Filter: ", Style::new().fg(t.dim)), ph])),
                 filt,
             );
-            let mut items: Vec<ListItem> = vis.iter().map(|s| ListItem::new(one_line(s))).collect();
+            // 2 columns for the highlight symbol.
+            let room = list.width.saturating_sub(2) as usize;
+            let mut items: Vec<ListItem> = vis
+                .iter()
+                .map(|s| ListItem::new(if save_to { keep_tail(&one_line(s), room) } else { one_line(s) }))
+                .collect();
             if items.is_empty() {
                 let msg = if picker.allow_custom && !picker.filter.value().is_empty() {
                     format!("Enter uses \"{}\"", picker.filter.value())
@@ -625,7 +648,6 @@ fn draw_modal(f: &mut Frame, area: Rect, m: &Modal) -> Option<Position> {
             let list_w = List::new(items)
                 .highlight_style(Style::new().bg(t.accent).fg(t.bg).bold())
                 .highlight_symbol(if *target == PickTarget::Scope { "● " } else { "› " });
-            // (PickTarget::SaveTo lists existing manifests + a new file.)
             f.render_stateful_widget(list_w, list, &mut st);
             Some(Position { x: filt.x + 8 + col, y: filt.y })
         }
@@ -823,6 +845,25 @@ mod tests {
         assert!(s.contains("dummy-one") && s.contains("VALUES REVEALED"));
         app.modal = None;
         assert!(render(&mut app, 160, 45).contains("Ctrl+D  Diff"), "the F3 button");
+    }
+
+    #[test]
+    fn save_to_list_keeps_the_label_and_the_file_name() {
+        let s = "this cluster     · ~/kseal-dev-clusters/test-pr12/repo/envs/prod/db.yaml";
+        assert_eq!(keep_tail(s, 200), s);
+        let short = keep_tail(s, 40);
+        assert_eq!(short.chars().count(), 40);
+        assert!(short.starts_with("this cluster     · …") && short.ends_with("/envs/prod/db.yaml"), "{short}");
+
+        let mut app = App::new();
+        let items = vec![s.to_string(), "new file         · ~/x/sealed-db.yaml".into()];
+        let picker = super::super::widgets::Picker::new("Save the SealedSecret to", items, "", false);
+        app.modal = Some(Modal::Picker { target: PickTarget::SaveTo, picker });
+        let wide = render(&mut app, 160, 30);
+        assert!(wide.contains("repo/envs/prod/db.yaml"), "the whole path at 160 columns");
+        let narrow = render(&mut app, 60, 20);
+        assert!(narrow.contains("…") && narrow.contains("db.yaml") && narrow.contains("this cluster"), "{narrow}");
+        render(&mut app, 1, 1);
     }
 
     #[test]
