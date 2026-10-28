@@ -650,7 +650,8 @@ mod tests {
         );
         w("overlays/dev/kustomization.yaml", "namespace: dev\nresources: [db.yaml]\n");
         let hits = find_manifests(root, "prod", "db");
-        let found: Vec<String> = hits.iter().map(|f| display_path(&f.path, root)).collect();
+        // `/`-separated so the expectation holds on Windows too.
+        let found: Vec<String> = hits.iter().map(|f| display_path(&f.path, root).replace('\\', "/")).collect();
         assert_eq!(
             found,
             vec!["apps/all.yaml", "apps/prod/db.yaml", "overlays/prod/db.yaml"],
