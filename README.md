@@ -146,6 +146,42 @@ kseal cert > cert.pem                         # then, offline: kseal seal --cert
 is auto-detected, or set it with `--controller-name` / `--controller-namespace`.
 Run `kseal <command> --help` for every flag.
 
+### From an AI agent
+
+Coding agents (Claude Code, Cursor, …) can run the commands above directly;
+kseal needs no MCP server. Anything a command prints lands in the model's
+context, so keep plaintext out of it:
+
+- **Seal without printing.** Pipe `gen` into `seal` and write to a file; the
+  values never reach stdout:
+
+  ```bash
+  kseal gen -f prod.env --name db -n prod | kseal seal --context prod -o sealed.yaml
+  kseal validate --context prod -f sealed.yaml
+  ```
+
+- **Name the context every time** (`--context` or `KSEAL_CONTEXT`). The
+  default is whatever the kubeconfig's current context happens to be.
+- **Only ciphertext and pass/fail are safe to show:** `seal`, `validate` and
+  `cert`.
+- **Don't let an agent run** `get`, `show` or `decode`: they print secret
+  values (`show` only with `--reveal`, but a flag can go anywhere on the line,
+  and permission rules match by prefix). Deny them in the agent's
+  permissions, e.g. in Claude Code's `.claude/settings.json`:
+
+  ```json
+  {
+    "permissions": {
+      "deny": ["Bash(kseal get:*)", "Bash(kseal show:*)", "Bash(kseal decode:*)"]
+    }
+  }
+  ```
+
+  The agent shouldn't read the `.env` file itself either; pass it by path.
+- `validate` exits non-zero when the controller can't decrypt the
+  SealedSecret (or the cluster can't be reached; the error is on stderr), so
+  an agent can check the result without parsing output.
+
 ## Development
 
 ```bash
