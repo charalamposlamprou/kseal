@@ -163,6 +163,20 @@ work: **the agent handles paths, contexts and git; you edit the values.**
    keys were added, changed or removed compared with the live Secret, and
    the commit.
 
+**A new service** has no live Secret to fetch, so the agent starts one from
+the key names instead. Those come from the service's config (its manifest,
+`.env.example`, docs) and aren't secret:
+
+```sh
+kseal-fetch CONTEXT NAMESPACE NAME --new STRIPE_KEY WEBHOOK_SECRET
+```
+
+This writes the same owner-only `.env` with empty `KEY=` lines. It refuses if
+the Secret already exists, or if it can't tell (unreachable cluster, no
+access). You fill in the values, and the agent seals as usual. `kseal-seal`
+refuses while any value is still empty, so a half-filled template is never
+committed.
+
 Both scripts are plain Bash (macOS bash 3.2 works) and need only kseal and
 git. Save them on your `PATH`, e.g. in `~/.local/bin`, and `chmod +x` them.
 
@@ -171,14 +185,27 @@ git. Save them on your `PATH`, e.g. in `~/.local/bin`, and `chmod +x` them.
 
 ```bash
 #!/usr/bin/env bash
-# kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force]
+# kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force] [--new KEY...]
 # Live Secret → an owner-only .env outside git, for you to edit.
+# --new KEY... starts a Secret that isn't in the cluster yet: empty KEY= lines.
 # Prints key names only. Won't overwrite unsealed edits without --force.
 set -euo pipefail
 die() { echo "kseal-fetch: $*" >&2; exit 1; }
-force=0; args=()
-for a in "$@"; do [ "$a" = --force ] && force=1 || args+=("$a"); done
-[ ${#args[@]} -ge 3 ] || die "usage: kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force]"
+usage="usage: kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force] [--new KEY...]"
+force=0 new=0; args=() keys=()
+for a in "$@"; do
+  if [ "$a" = --force ]; then force=1
+  elif [ "$a" = --new ]; then new=1
+  elif [ "$new" = 1 ]; then keys+=("$a")
+  else args+=("$a"); fi
+done
+[ ${#args[@]} -ge 3 ] || die "$usage"
+if [ "$new" = 1 ]; then
+  [ ${#keys[@]} -ge 1 ] || die "--new needs at least one KEY"
+  for k in "${keys[@]}"; do
+    case "$k" in [!A-Za-z_]*|*[!A-Za-z0-9_]*) die "'$k' isn't a valid key name (letters, digits, _)" ;; esac
+  done
+fi
 ctx="${args[0]}" ns="${args[1]}" name="${args[2]}"
 env="${args[3]:-$HOME/.kseal-secrets/${ctx//[\/:]/_}/$ns/$name.env}"
 
@@ -192,10 +219,23 @@ umask 077
 mkdir -p "$(dirname "$env")"
 tmp="$(mktemp "$env.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
-{
-  echo "# fetched-from: $ctx $ns/$name at $(date '+%F %R'). Never commit this file."
-  kseal get "$name" -n "$ns" --context "$ctx" 2>/dev/null
-} >"$tmp" || die "couldn't read $ns/$name from $ctx"
+if [ "$new" = 1 ]; then
+  # Only start a new file if the Secret really doesn't exist (404), not when
+  # the cluster is unreachable or access is denied.
+  if kseal get "$name" -n "$ns" --context "$ctx" >/dev/null 2>"$tmp"; then
+    die "$ns/$name already exists in $ctx; fetch it without --new"
+  fi
+  grep -q 'HTTP 404' "$tmp" || die "couldn't check whether $ns/$name exists in $ctx"
+  {
+    echo "# new: $ctx $ns/$name at $(date '+%F %R'). Fill in every value. Never commit this file."
+    for k in "${keys[@]}"; do echo "$k="; done
+  } >"$tmp"
+else
+  {
+    echo "# fetched-from: $ctx $ns/$name at $(date '+%F %R'). Never commit this file."
+    kseal get "$name" -n "$ns" --context "$ctx" 2>/dev/null
+  } >"$tmp" || die "couldn't read $ns/$name from $ctx"
+fi
 mv "$tmp" "$env"
 trap - EXIT
 
@@ -223,6 +263,9 @@ ctx="${args[0]}" ns="${args[1]}" name="${args[2]}" out="${args[3]}"
 env="${args[4]:-$HOME/.kseal-secrets/${ctx//[\/:]/_}/$ns/$name.env}"
 
 [ -f "$env" ] || die "$env not found; run kseal-fetch first"
+# A key left empty (e.g. from `kseal-fetch --new`) is almost always unfinished.
+empty="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=[[:space:]]*(""|'"''"')?[[:space:]]*$/\2/p' "$env" | tr '\n' ' ')"
+[ -z "$empty" ] || die "these keys have no value yet: $empty"
 if git -C "$(dirname "$env")" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   die "$env is inside a git repo; keep plaintext out of git"
 fi
@@ -308,7 +351,8 @@ How they behave:
 - **Cross-cluster is allowed.** A file fetched from one context can be sealed
   for another; the summary adds a `note:` line saying where it came from.
 - **Repo layout is yours.** For a new Secret, add the file to your
-  kustomization (or whatever your GitOps tool reads) in a separate commit.
+  kustomization (or whatever your GitOps tool reads) in a separate commit,
+  along with the Deployment's `envFrom`/`secretKeyRef` that uses it.
 - **`--push` pushes the current branch.** For a PR flow, have the agent
   create a branch first.
 - **Clean up when you're done.** The plaintext stays on disk until you
@@ -323,7 +367,9 @@ How they behave:
 - Never read, print, search or copy `.env` files or anything under
   `~/.kseal-secrets/`: no Read tool, `cat`, `grep`, `source`, `cp` into a repo.
   Only pass their path to `kseal-fetch` / `kseal-seal`.
-- Fetch with `kseal-fetch`, then stop: I edit the values. When I say "seal",
+- Fetch with `kseal-fetch`, then stop: I edit the values. For a Secret that
+  doesn't exist yet, use `kseal-fetch … --new KEY...` with the key names the
+  service expects. When I say "seal",
   run `kseal-seal` with the same context, namespace and name. Report its
   summary. If a key was removed, say so.
 - Don't run `kseal get`, `show`, `decode`, `encode` or `gen` yourself, and
