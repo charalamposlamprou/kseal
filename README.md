@@ -155,7 +155,9 @@ work: **the agent handles paths, contexts and git; you edit the values.**
 1. **Fetch** (agent): `kseal-fetch CONTEXT NAMESPACE NAME` copies the live
    Secret to `~/.kseal-secrets/<context>/<namespace>/<name>.env`, outside any
    git repo and owner-only. It prints key names only.
-2. **Edit** (you): add, change or remove `KEY=value` lines in that file.
+2. **Edit** (you): add, change or remove `KEY=value` lines in that file. A
+   multi-line value (a certificate, a JSON key file) is one line in double
+   quotes with `\n` for each line break: `tls.crt="-----BEGIN…\n…\n"`.
 3. **Seal** (agent): `kseal-seal CONTEXT NAMESPACE NAME path/in/gitops-repo.yaml --push`
    seals for that context's controller and validates the result. It then
    commits only that file and pushes the current branch. It never applies
@@ -274,11 +276,17 @@ else
   base="$(pairs_hash "$work/live.yaml")"
   {
     echo "# fetched-from: $ctx $ns/$name at $stamp. Never commit this file."
-    kseal get "$name" -n "$ns" --context "$ctx" 2>/dev/null
+    kseal get "$name" -n "$ns" --context "$ctx" 2>"$work/get.err"
   } >"$work/env" || die "couldn't read $ns/$name from $ctx"
+  # kseal leaves binary values out of a .env (and says so on stderr); sealing
+  # that file would delete them.
+  skipped="$(sed -n 's/^# skipped "\([^"]*\)".*/\1/p' "$work/get.err" | tr '\n' ' ')"
+  [ -z "$skipped" ] || die "$ns/$name has binary values a .env can't hold: $skipped. Edit it another way"
+  # A Secret's type can't change in place; kseal-seal keeps this one.
+  type="$(sed -n 's/^type: *//p' "$work/live.yaml" | head -1 | tr -d "\"'")"
 fi
 mv "$work/env" "$env"
-echo "base $base" >"$state"
+{ echo "base $base"; [ -z "${type:-}" ] || echo "type $type"; } >"$state"
 
 echo "kseal-fetch: $ctx $ns/$name → $env"
 echo "  keys: $(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z0-9_.-]+)[[:space:]]*=.*/\2/p' "$env" | tr '\n' ' ')"
@@ -293,22 +301,25 @@ exit 0
 
 ```bash
 #!/usr/bin/env bash
-# kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push] [--cert CERT.pem] [--force]
+# kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push] [--cert CERT.pem] [--force] [--allow-removals]
 # .env → SealedSecret at OUT.yaml in a GitOps repo: sealed for CONTEXT's
 # controller, validated, then committed (and pushed with --push).
 #   --cert CERT.pem  seal offline (`kseal cert` output): no cluster access,
 #                    so no validation and no live or sync checks
 #   --force          seal even if the live Secret changed since the fetch, or
 #                    git holds a change the cluster hasn't synced yet
+#   --allow-removals seal even though keys in the live Secret are missing
+#                    from the .env (they'd be deleted)
 # Never applies anything. Prints key names and pass/fail only.
 set -euo pipefail
 die() { echo "kseal-seal: $*" >&2; exit 1; }
-usage="usage: kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push] [--cert CERT.pem] [--force]"
-push=0 force=0 cert="" args=()
+usage="usage: kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push] [--cert CERT.pem] [--force] [--allow-removals]"
+push=0 force=0 removals=0 cert="" args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --push) push=1 ;;
     --force) force=1 ;;
+    --allow-removals) removals=1 ;;
     --cert) [ $# -ge 2 ] || die "--cert needs a file"; cert="$2"; shift ;;
     --*) die "$usage" ;;
     *) args+=("$1") ;;
@@ -337,7 +348,8 @@ fi
 # State next to the .env (outside git), written by kseal-fetch and kseal-seal:
 #   base   <hash of the live values at fetch time | none | unchecked>
 #   sealed <hash of the .env> <out> <git blob of out> <hash of the sealed values>
-base="$(awk '$1 == "base" {print $2}' "$state" 2>/dev/null)"
+base="$(awk '$1 == "base" {print $2}' "$state" 2>/dev/null || true)"
+type="$(awk '$1 == "type" {print $2}' "$state" 2>/dev/null || true)"
 read -r _ s_env s_out s_blob s_vals <<<"$(grep '^sealed ' "$state" 2>/dev/null || echo "sealed - - - -")"
 env_hash="$(git hash-object "$env")"
 if [ "$s_env" = "$env_hash" ] && [ "$s_out" = "$out" ] && [ -f "$out" ]; then
@@ -348,9 +360,18 @@ fi
 umask 077
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT   # EXIT only: an INT/TERM trap would keep running after a kill
-kseal gen -f "$env" --name "$name" -n "$ns" -o "$work/plain.yaml" 2>/dev/null ||
+kseal gen -f "$env" --name "$name" -n "$ns" -o "$work/gen.yaml" 2>/dev/null ||
   die "couldn't build a Secret from $env"
+# kseal gen guesses the type from the key names (tls.crt → kubernetes.io/tls).
+# Keep the live Secret's type instead: Kubernetes can't change it in place.
+if [ -n "$type" ]; then
+  sed "s|^type: .*|type: \"$type\"|" "$work/gen.yaml" >"$work/plain.yaml"
+else
+  mv "$work/gen.yaml" "$work/plain.yaml"
+fi
+new_type="$(sed -n 's/^type: *//p' "$work/plain.yaml" | head -1 | tr -d "\"'")"
 keys="$(kseal show -f "$work/plain.yaml" | awk 'NF {printf "%s ", $1}')"
+[ -n "$keys" ] || die "$env has no KEY=value lines; sealing it would empty the Secret"
 # Key/value lines as kseal parses them; compared and hashed, never printed.
 pairs() { kseal show --reveal -f "$1" 2>/dev/null | awk 'NF {k = $1; v = $0; sub(/^[^ ]+ +/, "", v); print k "\t" v}'; }
 vals_hash="$(pairs "$work/plain.yaml" | sort | git hash-object --stdin)"
@@ -369,6 +390,14 @@ if [ -z "$cert" ]; then
   # 1. Has the live Secret changed since the fetch? Sealing then would revert
   #    someone's change. Our own last seal, once synced, is expected.
   if kseal get "$name" -n "$ns" --context "$ctx" --format yaml >"$work/live.yaml" 2>/dev/null; then
+    # kseal can't put binary values in a .env (it says so on stderr), so a
+    # .env made from this Secret has lost them and sealing would delete them.
+    kseal get "$name" -n "$ns" --context "$ctx" >/dev/null 2>"$work/get.err" || true
+    skipped="$(sed -n 's/^# skipped "\([^"]*\)".*/\1/p' "$work/get.err" | tr '\n' ' ')"
+    [ -z "$skipped" ] || die "$ns/$name has binary values a .env can't hold ($skipped); sealing would delete them"
+    live_type="$(sed -n 's/^type: *//p' "$work/live.yaml" | head -1 | tr -d "\"'")"
+    [ "$live_type" = "$new_type" ] ||
+      die "this would change the type of $ns/$name from $live_type to $new_type, which Kubernetes refuses; the update would silently never apply"
     live="$(pairs "$work/live.yaml" | sort | git hash-object --stdin)"
     new_base="$live"   # once this seal lands, the live values now are the baseline
     if [ "$force" != 1 ] && [ "$live" != "$base" ] && [ "$live" != "$s_vals" ]; then
@@ -384,6 +413,10 @@ if [ -z "$cert" ]; then
       END { for (k in old) if (!(k in seen)) r = r " " k
             printf "added:%s  changed:%s  removed:%s", a ? a : " -", c ? c : " -", r ? r : " -" }
     ' <(pairs "$work/live.yaml") <(pairs "$work/plain.yaml"))"
+    removed="${changes##*removed: }"
+    if [ "$removed" != "-" ] && [ "$removals" != 1 ]; then
+      die "these keys would be deleted from $ns/$name: $removed. Put them back in $env, or pass --allow-removals"
+    fi
     if [ "$changes" = "added: -  changed: -  removed: -" ] && [ -f "$out" ]; then
       echo "kseal-seal: $ns/$name in $ctx already matches $env; nothing to seal"
       exit 0
@@ -428,6 +461,7 @@ git -C "$repo" add -- "$out"
 git -C "$repo" commit -q -m "seal: $ns/$name for $ctx" -m "keys: $keys"
 commit="$(git -C "$repo" rev-parse --short HEAD)"
 { [ -z "$new_base" ] || echo "base $new_base"
+  [ -z "$type" ] || echo "type $type"
   echo "sealed $env_hash $out $(git hash-object "$out") $vals_hash"; } >"$work/state"
 mv "$work/state" "$state"
 pushed=no
@@ -451,6 +485,15 @@ How they behave:
 
 - **Your edits are safe.** `kseal-fetch` won't overwrite a `.env` with
   unsealed edits unless you pass `--force`.
+- **Nothing gets deleted by accident.** `kseal-seal` refuses to remove a key
+  the live Secret has unless you pass `--allow-removals`, and refuses a
+  `.env` with no keys at all. `kseal-fetch` refuses a Secret with binary
+  values (a keystore, say): kseal can't put those in a `.env`, so sealing
+  would drop them.
+- **The Secret's type is kept.** `kseal gen` guesses the type from key names
+  (`tls.crt` → `kubernetes.io/tls`), but Kubernetes can't change a Secret's
+  type in place, and the update would silently never apply. The scripts
+  keep the live type, and refuse a seal that would change it.
 - **Nobody's change gets reverted.** `kseal-seal` pulls the GitOps repo
   first (fast-forward only). It refuses if the live Secret changed since you
   fetched it: sealing would undo that change. It also refuses if the file in
@@ -489,8 +532,8 @@ How they behave:
   the service expects. When I say "seal", run `kseal-seal` with the same
   context, namespace and name. Report its summary. If a key was removed, say
   so.
-- If a script refuses, report why and stop. Use `--force`, `--no-check` or
-  `--cert` only when I say so.
+- If a script refuses, report why and stop. Use `--force`,
+  `--allow-removals`, `--no-check` or `--cert` only when I say so.
 - Don't run `kseal get`, `show`, `decode`, `encode` or `gen` yourself, and
   never `kubectl apply` a SealedSecret or `kubectl get secret -o yaml`.
 - Never write a secret value in a command, commit, PR or reply. If one shows
