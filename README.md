@@ -150,37 +150,60 @@ Run `kseal <command> --help` for every flag.
 
 Coding agents (Claude Code, Cursor, …) can run the commands above directly;
 kseal needs no MCP server. Anything a command prints lands in the model's
-context, so keep plaintext out of it:
+context, so keep plaintext out of it.
 
-- **Seal without printing.** Pipe `gen` into `seal` and write to a file; the
-  values never reach stdout:
+- **Seal through a script, and let the agent run only that.** Permission
+  rules check the command the agent types, not what a script runs inside, so
+  the script can use `gen` while the agent can't:
 
   ```bash
-  kseal gen -f prod.env --name db -n prod | kseal seal --context prod -o sealed.yaml
-  kseal validate --context prod -f sealed.yaml
+  #!/usr/bin/env bash
+  # seal.sh CONTEXT NAME NAMESPACE FILE.env OUT.yaml — prints no values
+  set -euo pipefail
+  ctx="$1" name="$2" ns="$3" env="$4" out="$5"
+  tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+  kseal gen -f "$env" --name "$name" -n "$ns" -o "$tmp" 2>/dev/null ||
+    { echo "seal.sh: couldn't build a Secret from $env" >&2; exit 1; }
+  kseal seal -f "$tmp" --context "$ctx" -o "$out"
+  kseal validate -f "$out" --context "$ctx"
   ```
 
-- **Name the context every time** (`--context` or `KSEAL_CONTEXT`). The
-  default is whatever the kubeconfig's current context happens to be.
-- **Only ciphertext and pass/fail are safe to show:** `seal`, `validate` and
-  `cert`.
-- **Don't let an agent run** `get`, `show` or `decode`: they print secret
-  values (`show` only with `--reveal`, but a flag can go anywhere on the line,
-  and permission rules match by prefix). Deny them in the agent's
-  permissions, e.g. in Claude Code's `.claude/settings.json`:
+  `gen` writes to a temp file rather than a pipe, so its failure isn't
+  hidden behind a confusing error from `seal`. Its stderr is dropped, since
+  an error about the `.env` could quote a line of it.
+- **Pass `--context` on every call.** Agents usually run each command in a
+  fresh shell, so an exported `KSEAL_CONTEXT` is gone by the next call, and
+  kseal falls back to the kubeconfig's current context: the wrong controller.
+- **Commands that print secret values:** `get`, `decode`, `encode`, `gen`
+  without `-o` (base64 is still the value), and `show`. Masked `show` prints
+  one `•` per character up to 12, so it leaks the length of short values;
+  `--reveal` prints them. Safe to show: `seal` and `cert` (ciphertext and the
+  public certificate) and `validate` (pass/fail).
+- **Deny the rest,** e.g. in Claude Code's `.claude/settings.json`:
 
   ```json
   {
     "permissions": {
-      "deny": ["Bash(kseal get:*)", "Bash(kseal show:*)", "Bash(kseal decode:*)"]
+      "allow": ["Bash(./seal.sh:*)"],
+      "deny": [
+        "Bash(kseal get:*)", "Bash(kseal show:*)", "Bash(kseal decode:*)",
+        "Bash(kseal encode:*)", "Bash(kseal gen:*)",
+        "Read(**/.env)", "Read(**/*.env)", "Read(**/.env.*)"
+      ]
     }
   }
   ```
 
-  The agent shouldn't read the `.env` file itself either; pass it by path.
-- `validate` exits non-zero when the controller can't decrypt the
-  SealedSecret (or the cluster can't be reached; the error is on stderr), so
-  an agent can check the result without parsing output.
+  These rules are a backstop, not a sandbox: they match how a command starts,
+  so `/opt/homebrew/bin/kseal get …`, `command kseal get …` or `cat prod.env`
+  may get past them. Also tell the agent in its instructions never to read
+  `.env` files and to pass them only by path. For real isolation, keep
+  plaintext where the agent's user can't read it.
+- **Read `validate`'s stderr, not just its exit code.** It exits 0 with
+  `✓ … can decrypt this SealedSecret`. It exits 1 when the controller
+  `cannot decrypt this SealedSecret` (reseal), but also when the input has no
+  SealedSecret, no controller is found, or the API call fails (unreachable
+  cluster, RBAC denied). Resealing won't fix those.
 
 ## Development
 
