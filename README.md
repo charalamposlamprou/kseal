@@ -311,6 +311,8 @@ How they behave:
   kustomization (or whatever your GitOps tool reads) in a separate commit.
 - **`--push` pushes the current branch.** For a PR flow, have the agent
   create a branch first.
+- **Clean up when you're done.** The plaintext stays on disk until you
+  delete it: `rm ~/.kseal-secrets/<context>/<namespace>/<name>.env{,.sealed}`.
 
 **Tell the agent.** Add this to `~/.claude/CLAUDE.md` (Claude Code) or
 `AGENTS.md`:
