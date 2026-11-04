@@ -148,29 +148,215 @@ Run `kseal <command> --help` for every flag.
 
 ### From an AI agent
 
-Coding agents (Claude Code, Cursor, …) can run the commands above directly;
-kseal needs no MCP server. Anything a command prints lands in the model's
-context, so keep plaintext out of it.
+Coding agents (Claude Code, Cursor, Codex, …) can drive kseal with no MCP
+server. Anything a command prints lands in the model's context, so split the
+work: **the agent handles paths, contexts and git; you edit the values.**
 
-- **Seal through a script, and let the agent run only that.** Permission
-  rules check the command the agent types, not what a script runs inside, so
-  the script can use `gen` while the agent can't:
+1. **Fetch** (agent): `kseal-fetch CONTEXT NAMESPACE NAME` copies the live
+   Secret to `~/.kseal-secrets/<context>/<namespace>/<name>.env`, outside any
+   git repo and owner-only. It prints key names only.
+2. **Edit** (you): add, change or remove `KEY=value` lines in that file.
+3. **Seal** (agent): `kseal-seal CONTEXT NAMESPACE NAME path/in/gitops-repo.yaml --push`
+   seals for that context's controller and validates the result. It then
+   commits only that file and pushes the current branch. It never applies
+   anything: Argo CD or Flux syncs it from git. It prints key names, which
+   keys were added, changed or removed compared with the live Secret, and
+   the commit.
 
-  ```bash
-  #!/usr/bin/env bash
-  # seal.sh CONTEXT NAME NAMESPACE FILE.env OUT.yaml — prints no values
-  set -euo pipefail
-  ctx="$1" name="$2" ns="$3" env="$4" out="$5"
-  tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
-  kseal gen -f "$env" --name "$name" -n "$ns" -o "$tmp" 2>/dev/null ||
-    { echo "seal.sh: couldn't build a Secret from $env" >&2; exit 1; }
-  kseal seal -f "$tmp" --context "$ctx" -o "$out"
-  kseal validate -f "$out" --context "$ctx"
-  ```
+Both scripts are plain Bash (macOS bash 3.2 works) and need only kseal and
+git. Save them on your `PATH`, e.g. in `~/.local/bin`, and `chmod +x` them.
 
-  `gen` writes to a temp file rather than a pipe, so its failure isn't
-  hidden behind a confusing error from `seal`. Its stderr is dropped, since
-  an error about the `.env` could quote a line of it.
+<details>
+<summary><code>kseal-fetch</code></summary>
+
+```bash
+#!/usr/bin/env bash
+# kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force]
+# Live Secret → an owner-only .env outside git, for you to edit.
+# Prints key names only. Won't overwrite unsealed edits without --force.
+set -euo pipefail
+die() { echo "kseal-fetch: $*" >&2; exit 1; }
+force=0; args=()
+for a in "$@"; do [ "$a" = --force ] && force=1 || args+=("$a"); done
+[ ${#args[@]} -ge 3 ] || die "usage: kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force]"
+ctx="${args[0]}" ns="${args[1]}" name="${args[2]}"
+env="${args[3]:-$HOME/.kseal-secrets/${ctx//[\/:]/_}/$ns/$name.env}"
+
+# An existing .env may hold unsealed edits. It's safe to replace only if
+# kseal-seal stamped exactly this content as sealed.
+if [ -e "$env" ] && [ "$force" != 1 ] &&
+   [ "$(cut -d' ' -f1 "$env.sealed" 2>/dev/null)" != "$(git hash-object "$env")" ]; then
+  die "$env has unsealed edits; seal or delete it, or pass --force"
+fi
+umask 077
+mkdir -p "$(dirname "$env")"
+tmp="$(mktemp "$env.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+{
+  echo "# fetched-from: $ctx $ns/$name at $(date '+%F %R'). Never commit this file."
+  kseal get "$name" -n "$ns" --context "$ctx" 2>/dev/null
+} >"$tmp" || die "couldn't read $ns/$name from $ctx"
+mv "$tmp" "$env"
+trap - EXIT
+
+echo "kseal-fetch: $ctx $ns/$name → $env"
+echo "  keys: $(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$env" | tr -d = | tr '\n' ' ')"
+```
+
+</details>
+
+<details>
+<summary><code>kseal-seal</code></summary>
+
+```bash
+#!/usr/bin/env bash
+# kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push]
+# .env → SealedSecret at OUT.yaml in a GitOps repo: sealed for CONTEXT's
+# controller, validated, then committed (and pushed with --push).
+# Never applies anything. Prints key names and pass/fail only.
+set -euo pipefail
+die() { echo "kseal-seal: $*" >&2; exit 1; }
+push=0; args=()
+for a in "$@"; do [ "$a" = --push ] && push=1 || args+=("$a"); done
+[ ${#args[@]} -ge 4 ] || die "usage: kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push]"
+ctx="${args[0]}" ns="${args[1]}" name="${args[2]}" out="${args[3]}"
+env="${args[4]:-$HOME/.kseal-secrets/${ctx//[\/:]/_}/$ns/$name.env}"
+
+[ -f "$env" ] || die "$env not found; run kseal-fetch first"
+if git -C "$(dirname "$env")" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  die "$env is inside a git repo; keep plaintext out of git"
+fi
+mkdir -p "$(dirname "$out")"
+out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
+repo="$(git -C "$(dirname "$out")" rev-parse --show-toplevel 2>/dev/null)" || die "$out isn't inside a git repo"
+[ -z "$(git -C "$repo" status --porcelain)" ] || die "$repo has uncommitted changes"
+
+# A stamp next to the .env (outside git) remembers the last seal, so a re-run
+# before GitOps has synced doesn't commit the same values again.
+stamp="$env.sealed"
+if [ -f "$stamp" ] && [ -f "$out" ] &&
+   [ "$(cat "$stamp")" = "$(git hash-object "$env") $out" ]; then
+  echo "kseal-seal: $env is unchanged since it was sealed to $out; nothing to seal"
+  exit 0
+fi
+
+umask 077
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT   # EXIT only: an INT/TERM trap would keep running after a kill
+kseal gen -f "$env" --name "$name" -n "$ns" -o "$work/plain.yaml" 2>/dev/null ||
+  die "couldn't build a Secret from $env"
+keys="$(kseal show -f "$work/plain.yaml" | awk 'NF {printf "%s ", $1}')"
+
+# Key names added / changed / removed vs the live Secret. Values are compared
+# in memory and never printed.
+pairs() { kseal show --reveal -f "$1" 2>/dev/null | awk 'NF {k=$1; v=$0; sub(/^[^ ]+ +/, "", v); print k "\t" v}'; }
+if kseal get "$name" -n "$ns" --context "$ctx" --format yaml >"$work/live.yaml" 2>/dev/null; then
+  changes="$(awk -F'\t' '
+    FNR == NR { old[$1] = $2; next }
+    { if (!($1 in old)) a = a " " $1; else if (old[$1] != $2) c = c " " $1; seen[$1] = 1 }
+    END { for (k in old) if (!(k in seen)) r = r " " k
+          printf "added:%s  changed:%s  removed:%s", a ? a : " -", c ? c : " -", r ? r : " -" }
+  ' <(pairs "$work/live.yaml") <(pairs "$work/plain.yaml"))"
+  if [ "$changes" = "added: -  changed: -  removed: -" ] && [ -f "$out" ]; then
+    echo "kseal-seal: $ns/$name in $ctx already matches $env; nothing to seal"
+    exit 0
+  fi
+else
+  changes="live Secret not readable (new, or no access)"
+fi
+from="$(sed -n 's/^# fetched-from: \([^ ]*\) .*/\1/p' "$env" | head -1)"
+
+# Seal and validate in the temp dir, so a failure never leaves a file in the repo.
+kseal seal -f "$work/plain.yaml" --context "$ctx" --scope strict -o "$work/sealed.yaml" 2>/dev/null ||
+  die "sealing for $ctx failed"
+kseal validate -f "$work/sealed.yaml" --context "$ctx" 2>"$work/validate.err" ||
+  die "$(cat "$work/validate.err")"
+mv "$work/sealed.yaml" "$out"
+
+git -C "$repo" add -- "$out"
+git -C "$repo" commit -q -m "seal: $ns/$name for $ctx" -m "keys: $keys"
+commit="$(git -C "$repo" rev-parse --short HEAD)"
+echo "$(git hash-object "$env") $out" >"$stamp"
+pushed=no
+if [ "$push" = 1 ]; then
+  git -C "$repo" push -q -u origin HEAD 2>/dev/null || die "committed $commit, but the push failed"
+  pushed="$(git -C "$repo" rev-parse --abbrev-ref HEAD)"
+fi
+
+echo "kseal-seal: $ctx $ns/$name → $out"
+[ -n "$from" ] && [ "$from" != "$ctx" ] && echo "  note:      $env was fetched from $from"
+echo "  keys:      $keys"
+echo "  vs live:   $changes"
+echo "  validated: yes (not applied; GitOps syncs it)"
+echo "  commit:    $commit   pushed: $pushed"
+```
+
+</details>
+
+How they behave:
+
+- **Your edits are safe.** `kseal-fetch` won't overwrite a `.env` with
+  unsealed edits unless you pass `--force`.
+- **Re-runs don't add commits.** Every seal produces new ciphertext, so
+  `kseal-seal` writes a stamp (`<name>.env.sealed`, a git hash of the `.env`)
+  and does nothing if the file hasn't changed since. That holds even before
+  GitOps has synced. It also does nothing when the file already matches the
+  live Secret.
+- **Refusals:** it won't run when the `.env` is inside a git repo, when the
+  GitOps repo has uncommitted changes, or when the controller can't decrypt
+  the result. A failed seal or validate never leaves a file in the repo.
+- **Cross-cluster is allowed.** A file fetched from one context can be sealed
+  for another; the summary adds a `note:` line saying where it came from.
+- **Repo layout is yours.** For a new Secret, add the file to your
+  kustomization (or whatever your GitOps tool reads) in a separate commit.
+- **`--push` pushes the current branch.** For a PR flow, have the agent
+  create a branch first.
+- **Clean up when you're done.** The plaintext stays on disk until you
+  delete it: `rm ~/.kseal-secrets/<context>/<namespace>/<name>.env{,.sealed}`.
+
+**Tell the agent.** Add this to `~/.claude/CLAUDE.md` (Claude Code) or
+`AGENTS.md`:
+
+```markdown
+## Secrets
+
+- Never read, print, search or copy `.env` files or anything under
+  `~/.kseal-secrets/`: no Read tool, `cat`, `grep`, `source`, `cp` into a repo.
+  Only pass their path to `kseal-fetch` / `kseal-seal`.
+- Fetch with `kseal-fetch`, then stop: I edit the values. When I say "seal",
+  run `kseal-seal` with the same context, namespace and name. Report its
+  summary. If a key was removed, say so.
+- Don't run `kseal get`, `show`, `decode`, `encode` or `gen` yourself, and
+  never `kubectl apply` a SealedSecret or `kubectl get secret -o yaml`.
+- Never write a secret value in a command, commit, PR or reply. If one shows
+  up in output by accident, stop and tell me.
+```
+
+**Enforce it.** Instructions alone don't stop anything. Add permission rules,
+e.g. in Claude Code's `~/.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(kseal-fetch:*)", "Bash(kseal-seal:*)"],
+    "deny": [
+      "Bash(kseal get:*)", "Bash(kseal show:*)", "Bash(kseal decode:*)",
+      "Bash(kseal encode:*)", "Bash(kseal gen:*)",
+      "Read(**/.env)", "Read(**/*.env)", "Read(**/.env.*)",
+      "Read(~/.kseal-secrets/**)"
+    ]
+  }
+}
+```
+
+Rules check the command the agent types, not what a script runs inside, so
+the scripts still work. The rules are a backstop, not a sandbox: they match
+how a command starts, so `/opt/homebrew/bin/kseal get …`, `command kseal …`
+or `cat file.env` may get past them. For real isolation, keep plaintext
+where the agent's user can't read it.
+
+If you call kseal directly instead:
+
 - **Pass `--context` on every call.** Agents usually run each command in a
   fresh shell, so an exported `KSEAL_CONTEXT` is gone by the next call, and
   kseal falls back to the kubeconfig's current context: the wrong controller.
@@ -179,31 +365,13 @@ context, so keep plaintext out of it.
   one `•` per character up to 12, so it leaks the length of short values;
   `--reveal` prints them. Safe to show: `seal` and `cert` (ciphertext and the
   public certificate) and `validate` (pass/fail).
-- **Deny the rest,** e.g. in Claude Code's `.claude/settings.json`:
-
-  ```json
-  {
-    "permissions": {
-      "allow": ["Bash(./seal.sh:*)"],
-      "deny": [
-        "Bash(kseal get:*)", "Bash(kseal show:*)", "Bash(kseal decode:*)",
-        "Bash(kseal encode:*)", "Bash(kseal gen:*)",
-        "Read(**/.env)", "Read(**/*.env)", "Read(**/.env.*)"
-      ]
-    }
-  }
-  ```
-
-  These rules are a backstop, not a sandbox: they match how a command starts,
-  so `/opt/homebrew/bin/kseal get …`, `command kseal get …` or `cat prod.env`
-  may get past them. Also tell the agent in its instructions never to read
-  `.env` files and to pass them only by path. For real isolation, keep
-  plaintext where the agent's user can't read it.
 - **Read `validate`'s stderr, not just its exit code.** It exits 0 with
   `✓ … can decrypt this SealedSecret`. It exits 1 when the controller
   `cannot decrypt this SealedSecret` (reseal), but also when the input has no
   SealedSecret, no controller is found, or the API call fails (unreachable
   cluster, RBAC denied). Resealing won't fix those.
+- **Write `gen`'s output to a file with `-o`, not a pipe,** so a failure
+  shows its own error instead of a confusing one from `seal`.
 
 ## Development
 
