@@ -168,79 +168,122 @@ the key names instead. Those come from the service's config (its manifest,
 `.env.example`, docs) and aren't secret:
 
 ```sh
-kseal-fetch CONTEXT NAMESPACE NAME --new STRIPE_KEY WEBHOOK_SECRET
+kseal-fetch CONTEXT NAMESPACE NAME --new STRIPE_KEY,WEBHOOK_SECRET
 ```
 
-This writes the same owner-only `.env` with empty `KEY=` lines. It refuses if
-the Secret already exists, or if it can't tell (unreachable cluster, no
-access). You fill in the values, and the agent seals as usual. `kseal-seal`
-refuses while any value is still empty, so a half-filled template is never
-committed.
+This writes the same owner-only `.env` with empty `KEY=` lines. Key names
+follow kseal's rules (letters, digits, `_`, `.`, `-`, so `tls.crt` works).
+It refuses if the Secret already exists, if the namespace doesn't, or if it
+can't tell. You fill in the values, and the agent seals as usual.
+`kseal-seal` refuses to seal a template while any value is still empty, so a
+half-filled one is never committed. A fetched Secret may keep a value that's
+empty on purpose.
 
-Both scripts are plain Bash (macOS bash 3.2 works) and need only kseal and
-git. Save them on your `PATH`, e.g. in `~/.local/bin`, and `chmod +x` them.
+**Restricted clusters** (often prod): without read access to Secrets, start
+with `--new KEY,... --no-check` and type in every value. Without access to
+the controller, seal offline with a certificate someone exports once with
+`kseal cert`: `kseal-seal … --cert cert.pem`. That skips validation and the
+safety checks below, and the summary says so.
+
+Both scripts are plain Bash (macOS bash 3.2 works) and need kseal, git and
+kubectl (only for the namespace and git-vs-cluster checks). Save them on your `PATH`, e.g. in `~/.local/bin`, and `chmod +x` them.
 
 <details>
 <summary><code>kseal-fetch</code></summary>
 
 ```bash
 #!/usr/bin/env bash
-# kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force] [--new KEY...]
+# kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force] [--new KEY,KEY...] [--no-check]
 # Live Secret → an owner-only .env outside git, for you to edit.
-# --new KEY... starts a Secret that isn't in the cluster yet: empty KEY= lines.
-# Prints key names only. Won't overwrite unsealed edits without --force.
+#   --new KEY,...  start a Secret that isn't in the cluster yet (empty KEY= lines);
+#                  checks the namespace exists and the Secret doesn't
+#   --no-check     with --new: skip that check (no read access to the cluster)
+#   --force        replace a .env that has unsealed edits
+# Prints key names only.
 set -euo pipefail
 die() { echo "kseal-fetch: $*" >&2; exit 1; }
-usage="usage: kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force] [--new KEY...]"
-force=0 new=0; args=() keys=()
-for a in "$@"; do
-  if [ "$a" = --force ]; then force=1
-  elif [ "$a" = --new ]; then new=1
-  elif [ "$new" = 1 ]; then keys+=("$a")
-  else args+=("$a"); fi
+usage="usage: kseal-fetch CONTEXT NAMESPACE NAME [FILE.env] [--force] [--new KEY,KEY...] [--no-check]"
+force=0 check=1 isnew=0 new="" args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force) force=1 ;;
+    --no-check) check=0 ;;
+    --new) [ $# -ge 2 ] || die "--new needs KEY,KEY..."; isnew=1; new="$2"; shift ;;
+    --*) die "$usage" ;;
+    *) args+=("$1") ;;
+  esac
+  shift
 done
 [ ${#args[@]} -ge 3 ] || die "$usage"
-if [ "$new" = 1 ]; then
-  [ ${#keys[@]} -ge 1 ] || die "--new needs at least one KEY"
-  for k in "${keys[@]}"; do
-    case "$k" in [!A-Za-z_]*|*[!A-Za-z0-9_]*) die "'$k' isn't a valid key name (letters, digits, _)" ;; esac
-  done
-fi
 ctx="${args[0]}" ns="${args[1]}" name="${args[2]}"
 env="${args[3]:-$HOME/.kseal-secrets/${ctx//[\/:]/_}/$ns/$name.env}"
+state="$env.state"
+
+keys=()
+if [ "$isnew" = 1 ]; then
+  case "$new" in ""|,*|*,|*,,*) die "--new has an empty key name: '$new'" ;; esac
+  IFS=, read -r -a keys <<<"$new"
+  seen=" "
+  for k in "${keys[@]}"; do
+    case "$k" in *[!A-Za-z0-9_.-]*) die "'$k' isn't a valid key name (letters, digits, _ . -)" ;; esac
+    case "$seen" in *" $k "*) die "'$k' is listed twice" ;; esac
+    seen="$seen$k "
+  done
+fi
 
 # An existing .env may hold unsealed edits. It's safe to replace only if
-# kseal-seal stamped exactly this content as sealed.
+# kseal-seal recorded exactly this content as sealed.
 if [ -e "$env" ] && [ "$force" != 1 ] &&
-   [ "$(cut -d' ' -f1 "$env.sealed" 2>/dev/null)" != "$(git hash-object "$env")" ]; then
+   [ "$(awk '$1 == "sealed" {print $2}' "$state" 2>/dev/null)" != "$(git hash-object "$env")" ]; then
   die "$env has unsealed edits; seal or delete it, or pass --force"
 fi
+
+# Hash of the live values as kseal parses them (never printed). kseal-seal
+# compares it to the live Secret again, to catch a change made since now.
+pairs_hash() {
+  kseal show --reveal -f "$1" 2>/dev/null |
+    awk 'NF {k = $1; v = $0; sub(/^[^ ]+ +/, "", v); print k "\t" v}' | sort | git hash-object --stdin
+}
+
 umask 077
 mkdir -p "$(dirname "$env")"
-tmp="$(mktemp "$env.XXXXXX")"
-trap 'rm -f "$tmp"' EXIT
-if [ "$new" = 1 ]; then
-  # Only start a new file if the Secret really doesn't exist (404), not when
-  # the cluster is unreachable or access is denied.
-  if kseal get "$name" -n "$ns" --context "$ctx" >/dev/null 2>"$tmp"; then
-    die "$ns/$name already exists in $ctx; fetch it without --new"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+stamp="$(date '+%F %R')"
+if [ "$isnew" = 1 ]; then
+  base=unchecked
+  if [ "$check" = 1 ]; then
+    # Only a clean "not found" counts, and only in a namespace that exists:
+    # a 404 also comes back for a mistyped namespace.
+    if kseal get "$name" -n "$ns" --context "$ctx" >/dev/null 2>"$work/err"; then
+      die "$ns/$name already exists in $ctx; fetch it without --new"
+    fi
+    grep -q 'HTTP 404' "$work/err" || die "couldn't check whether $ns/$name exists in $ctx (pass --no-check to skip)"
+    command -v kubectl >/dev/null || die "checking the namespace needs kubectl (or pass --no-check)"
+    kubectl --context "$ctx" get namespace "$ns" >/dev/null 2>&1 ||
+      die "namespace $ns doesn't exist in $ctx, or you can't read it (pass --no-check if you're sure)"
+    base=none
   fi
-  grep -q 'HTTP 404' "$tmp" || die "couldn't check whether $ns/$name exists in $ctx"
   {
-    echo "# new: $ctx $ns/$name at $(date '+%F %R'). Fill in every value. Never commit this file."
+    echo "# new: $ctx $ns/$name at $stamp. Fill in every value. Never commit this file."
     for k in "${keys[@]}"; do echo "$k="; done
-  } >"$tmp"
+  } >"$work/env"
 else
+  kseal get "$name" -n "$ns" --context "$ctx" --format yaml >"$work/live.yaml" 2>/dev/null ||
+    die "couldn't read $ns/$name from $ctx (for a new Secret, use --new)"
+  base="$(pairs_hash "$work/live.yaml")"
   {
-    echo "# fetched-from: $ctx $ns/$name at $(date '+%F %R'). Never commit this file."
+    echo "# fetched-from: $ctx $ns/$name at $stamp. Never commit this file."
     kseal get "$name" -n "$ns" --context "$ctx" 2>/dev/null
-  } >"$tmp" || die "couldn't read $ns/$name from $ctx"
+  } >"$work/env" || die "couldn't read $ns/$name from $ctx"
 fi
-mv "$tmp" "$env"
-trap - EXIT
+mv "$work/env" "$env"
+echo "base $base" >"$state"
 
 echo "kseal-fetch: $ctx $ns/$name → $env"
-echo "  keys: $(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$env" | tr -d = | tr '\n' ' ')"
+echo "  keys: $(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z0-9_.-]+)[[:space:]]*=.*/\2/p' "$env" | tr '\n' ' ')"
+[ "$base" = unchecked ] && echo "  note: not checked against $ctx (--no-check)"
+exit 0
 ```
 
 </details>
@@ -250,22 +293,35 @@ echo "  keys: $(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$env" | tr -d = | tr '\n' '
 
 ```bash
 #!/usr/bin/env bash
-# kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push]
+# kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push] [--cert CERT.pem] [--force]
 # .env → SealedSecret at OUT.yaml in a GitOps repo: sealed for CONTEXT's
 # controller, validated, then committed (and pushed with --push).
+#   --cert CERT.pem  seal offline (`kseal cert` output): no cluster access,
+#                    so no validation and no live or sync checks
+#   --force          seal even if the live Secret changed since the fetch, or
+#                    git holds a change the cluster hasn't synced yet
 # Never applies anything. Prints key names and pass/fail only.
 set -euo pipefail
 die() { echo "kseal-seal: $*" >&2; exit 1; }
-push=0; args=()
-for a in "$@"; do [ "$a" = --push ] && push=1 || args+=("$a"); done
-[ ${#args[@]} -ge 4 ] || die "usage: kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push]"
+usage="usage: kseal-seal CONTEXT NAMESPACE NAME OUT.yaml [FILE.env] [--push] [--cert CERT.pem] [--force]"
+push=0 force=0 cert="" args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --push) push=1 ;;
+    --force) force=1 ;;
+    --cert) [ $# -ge 2 ] || die "--cert needs a file"; cert="$2"; shift ;;
+    --*) die "$usage" ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+[ ${#args[@]} -ge 4 ] || die "$usage"
 ctx="${args[0]}" ns="${args[1]}" name="${args[2]}" out="${args[3]}"
 env="${args[4]:-$HOME/.kseal-secrets/${ctx//[\/:]/_}/$ns/$name.env}"
+state="$env.state"
+[ -z "$cert" ] || [ -f "$cert" ] || die "$cert not found"
 
 [ -f "$env" ] || die "$env not found; run kseal-fetch first"
-# A key left empty (e.g. from `kseal-fetch --new`) is almost always unfinished.
-empty="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=[[:space:]]*(""|'"''"')?[[:space:]]*$/\2/p' "$env" | tr '\n' ' ')"
-[ -z "$empty" ] || die "these keys have no value yet: $empty"
 if git -C "$(dirname "$env")" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   die "$env is inside a git repo; keep plaintext out of git"
 fi
@@ -273,12 +329,18 @@ mkdir -p "$(dirname "$out")"
 out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
 repo="$(git -C "$(dirname "$out")" rev-parse --show-toplevel 2>/dev/null)" || die "$out isn't inside a git repo"
 [ -z "$(git -C "$repo" status --porcelain)" ] || die "$repo has uncommitted changes"
+# Seal on top of the latest, so nobody's newer change is overwritten.
+if git -C "$repo" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+  git -C "$repo" pull -q --ff-only 2>/dev/null || die "couldn't fast-forward $repo to its upstream"
+fi
 
-# A stamp next to the .env (outside git) remembers the last seal, so a re-run
-# before GitOps has synced doesn't commit the same values again.
-stamp="$env.sealed"
-if [ -f "$stamp" ] && [ -f "$out" ] &&
-   [ "$(cat "$stamp")" = "$(git hash-object "$env") $out" ]; then
+# State next to the .env (outside git), written by kseal-fetch and kseal-seal:
+#   base   <hash of the live values at fetch time | none | unchecked>
+#   sealed <hash of the .env> <out> <git blob of out> <hash of the sealed values>
+base="$(awk '$1 == "base" {print $2}' "$state" 2>/dev/null)"
+read -r _ s_env s_out s_blob s_vals <<<"$(grep '^sealed ' "$state" 2>/dev/null || echo "sealed - - - -")"
+env_hash="$(git hash-object "$env")"
+if [ "$s_env" = "$env_hash" ] && [ "$s_out" = "$out" ] && [ -f "$out" ]; then
   echo "kseal-seal: $env is unchanged since it was sealed to $out; nothing to seal"
   exit 0
 fi
@@ -289,37 +351,85 @@ trap 'rm -rf "$work"' EXIT   # EXIT only: an INT/TERM trap would keep running af
 kseal gen -f "$env" --name "$name" -n "$ns" -o "$work/plain.yaml" 2>/dev/null ||
   die "couldn't build a Secret from $env"
 keys="$(kseal show -f "$work/plain.yaml" | awk 'NF {printf "%s ", $1}')"
+# Key/value lines as kseal parses them; compared and hashed, never printed.
+pairs() { kseal show --reveal -f "$1" 2>/dev/null | awk 'NF {k = $1; v = $0; sub(/^[^ ]+ +/, "", v); print k "\t" v}'; }
+vals_hash="$(pairs "$work/plain.yaml" | sort | git hash-object --stdin)"
 
-# Key names added / changed / removed vs the live Secret. Values are compared
-# in memory and never printed.
-pairs() { kseal show --reveal -f "$1" 2>/dev/null | awk 'NF {k=$1; v=$0; sub(/^[^ ]+ +/, "", v); print k "\t" v}'; }
-if kseal get "$name" -n "$ns" --context "$ctx" --format yaml >"$work/live.yaml" 2>/dev/null; then
-  changes="$(awk -F'\t' '
-    FNR == NR { old[$1] = $2; next }
-    { if (!($1 in old)) a = a " " $1; else if (old[$1] != $2) c = c " " $1; seen[$1] = 1 }
-    END { for (k in old) if (!(k in seen)) r = r " " k
-          printf "added:%s  changed:%s  removed:%s", a ? a : " -", c ? c : " -", r ? r : " -" }
-  ' <(pairs "$work/live.yaml") <(pairs "$work/plain.yaml"))"
-  if [ "$changes" = "added: -  changed: -  removed: -" ] && [ -f "$out" ]; then
-    echo "kseal-seal: $ns/$name in $ctx already matches $env; nothing to seal"
-    exit 0
-  fi
-else
-  changes="live Secret not readable (new, or no access)"
+if head -1 "$env" | grep -q '^# new:'; then
+  # A template from `kseal-fetch --new`: an empty value is unfinished.
+  empty="$(kseal show --reveal -f "$work/plain.yaml" 2>/dev/null | awk 'NF == 1 {printf "%s ", $1}')"
+  [ -z "$empty" ] || die "these keys have no value yet: $empty"
 fi
-from="$(sed -n 's/^# fetched-from: \([^ ]*\) .*/\1/p' "$env" | head -1)"
+from="$(sed -nE 's/^# (fetched-from|new): ([^ ]+) .*/\2/p' "$env" | head -1)"
 
-# Seal and validate in the temp dir, so a failure never leaves a file in the repo.
-kseal seal -f "$work/plain.yaml" --context "$ctx" --scope strict -o "$work/sealed.yaml" 2>/dev/null ||
-  die "sealing for $ctx failed"
-kseal validate -f "$work/sealed.yaml" --context "$ctx" 2>"$work/validate.err" ||
-  die "$(cat "$work/validate.err")"
+new_base="$base"
+changes="not checked (offline)"
+checks="skipped (offline cert)"
+if [ -z "$cert" ]; then
+  # 1. Has the live Secret changed since the fetch? Sealing then would revert
+  #    someone's change. Our own last seal, once synced, is expected.
+  if kseal get "$name" -n "$ns" --context "$ctx" --format yaml >"$work/live.yaml" 2>/dev/null; then
+    live="$(pairs "$work/live.yaml" | sort | git hash-object --stdin)"
+    new_base="$live"   # once this seal lands, the live values now are the baseline
+    if [ "$force" != 1 ] && [ "$live" != "$base" ] && [ "$live" != "$s_vals" ]; then
+      case "$base" in
+        ""|unchecked) ;;   # no fetch record (hand-made .env, or --no-check)
+        none) die "$ns/$name now exists in $ctx; fetch it instead of using a --new template (or --force)" ;;
+        *) die "the live $ns/$name changed since you fetched it. Move $env aside, fetch again and redo your edits (or --force)" ;;
+      esac
+    fi
+    changes="$(awk -F'\t' '
+      FNR == NR { old[$1] = $2; next }
+      { if (!($1 in old)) a = a " " $1; else if (old[$1] != $2) c = c " " $1; seen[$1] = 1 }
+      END { for (k in old) if (!(k in seen)) r = r " " k
+            printf "added:%s  changed:%s  removed:%s", a ? a : " -", c ? c : " -", r ? r : " -" }
+    ' <(pairs "$work/live.yaml") <(pairs "$work/plain.yaml"))"
+    if [ "$changes" = "added: -  changed: -  removed: -" ] && [ -f "$out" ]; then
+      echo "kseal-seal: $ns/$name in $ctx already matches $env; nothing to seal"
+      exit 0
+    fi
+  else
+    case "$base" in
+      ""|none|unchecked) changes="new Secret" ;;
+      *) [ "$force" = 1 ] || die "couldn't re-read $ns/$name from $ctx to check it hasn't changed (or --force)"
+         changes="live Secret not readable" ;;
+    esac
+  fi
+
+  # 2. Does git hold a change the cluster hasn't synced yet? Sealing on top of
+  #    it would drop it. Our own unsynced seal is fine.
+  if [ "$force" != 1 ] && git -C "$repo" ls-files --error-unmatch -- "$out" >/dev/null 2>&1 &&
+     [ "$(git hash-object "$out")" != "$s_blob" ]; then
+    command -v kubectl >/dev/null || die "checking git against the cluster needs kubectl (or --force)"
+    want="$(kubectl --context "$ctx" create --dry-run=client -f "$out" -o jsonpath='{.spec.encryptedData}' 2>/dev/null)" ||
+      die "couldn't read $out as a SealedSecret (or --force)"
+    have="$(kubectl --context "$ctx" -n "$ns" get sealedsecret "$name" -o jsonpath='{.spec.encryptedData}' 2>"$work/err")" ||
+      grep -q NotFound "$work/err" ||
+      die "couldn't read the SealedSecret $ns/$name from $ctx to compare with git (or --force)"
+    [ "$want" = "$have" ] ||
+      die "$out in git differs from the SealedSecret in $ctx: a change hasn't synced yet. Wait for the sync, then fetch again (or --force)"
+  fi
+  checks="$([ "$force" = 1 ] && echo "skipped (--force)" || echo passed)"
+
+  # Seal and validate in the temp dir, so a failure never leaves a file in the repo.
+  kseal seal -f "$work/plain.yaml" --context "$ctx" --scope strict -o "$work/sealed.yaml" 2>/dev/null ||
+    die "sealing for $ctx failed"
+  kseal validate -f "$work/sealed.yaml" --context "$ctx" 2>"$work/validate.err" ||
+    die "$(cat "$work/validate.err")"
+  validated="yes"
+else
+  kseal seal -f "$work/plain.yaml" --cert "$cert" --scope strict -o "$work/sealed.yaml" 2>/dev/null ||
+    die "sealing with $cert failed"
+  validated="no (offline: check with kseal validate --context $ctx once you can reach it)"
+fi
 mv "$work/sealed.yaml" "$out"
 
 git -C "$repo" add -- "$out"
 git -C "$repo" commit -q -m "seal: $ns/$name for $ctx" -m "keys: $keys"
 commit="$(git -C "$repo" rev-parse --short HEAD)"
-echo "$(git hash-object "$env") $out" >"$stamp"
+{ [ -z "$new_base" ] || echo "base $new_base"
+  echo "sealed $env_hash $out $(git hash-object "$out") $vals_hash"; } >"$work/state"
+mv "$work/state" "$state"
 pushed=no
 if [ "$push" = 1 ]; then
   git -C "$repo" push -q -u origin HEAD 2>/dev/null || die "committed $commit, but the push failed"
@@ -327,10 +437,11 @@ if [ "$push" = 1 ]; then
 fi
 
 echo "kseal-seal: $ctx $ns/$name → $out"
-[ -n "$from" ] && [ "$from" != "$ctx" ] && echo "  note:      $env was fetched from $from"
+[ -n "$from" ] && [ "$from" != "$ctx" ] && echo "  note:      $env was made for $from"
 echo "  keys:      $keys"
 echo "  vs live:   $changes"
-echo "  validated: yes (not applied; GitOps syncs it)"
+echo "  checks:    $checks"
+echo "  validated: $validated (not applied; GitOps syncs it)"
 echo "  commit:    $commit   pushed: $pushed"
 ```
 
@@ -340,11 +451,17 @@ How they behave:
 
 - **Your edits are safe.** `kseal-fetch` won't overwrite a `.env` with
   unsealed edits unless you pass `--force`.
-- **Re-runs don't add commits.** Every seal produces new ciphertext, so
-  `kseal-seal` writes a stamp (`<name>.env.sealed`, a git hash of the `.env`)
-  and does nothing if the file hasn't changed since. That holds even before
-  GitOps has synced. It also does nothing when the file already matches the
-  live Secret.
+- **Nobody's change gets reverted.** `kseal-seal` pulls the GitOps repo
+  first (fast-forward only). It refuses if the live Secret changed since you
+  fetched it: sealing would undo that change. It also refuses if the file in
+  git differs from the SealedSecret in the cluster, meaning someone's change
+  hasn't synced yet. Your own unsynced seals don't count. `--force` overrides
+  both checks.
+- **Re-runs don't add commits.** Every seal produces new ciphertext, so the
+  scripts keep a state file next to the `.env` (`<name>.env.state`, hashes
+  only) and do nothing if the `.env` hasn't changed since the last seal. That
+  holds even before GitOps has synced. It also does nothing when the file
+  already matches the live Secret.
 - **Refusals:** it won't run when the `.env` is inside a git repo, when the
   GitOps repo has uncommitted changes, or when the controller can't decrypt
   the result. A failed seal or validate never leaves a file in the repo.
@@ -356,7 +473,7 @@ How they behave:
 - **`--push` pushes the current branch.** For a PR flow, have the agent
   create a branch first.
 - **Clean up when you're done.** The plaintext stays on disk until you
-  delete it: `rm ~/.kseal-secrets/<context>/<namespace>/<name>.env{,.sealed}`.
+  delete it: `rm ~/.kseal-secrets/<context>/<namespace>/<name>.env{,.state}`.
 
 **Tell the agent.** Add this to `~/.claude/CLAUDE.md` (Claude Code) or
 `AGENTS.md`:
@@ -368,10 +485,12 @@ How they behave:
   `~/.kseal-secrets/`: no Read tool, `cat`, `grep`, `source`, `cp` into a repo.
   Only pass their path to `kseal-fetch` / `kseal-seal`.
 - Fetch with `kseal-fetch`, then stop: I edit the values. For a Secret that
-  doesn't exist yet, use `kseal-fetch … --new KEY...` with the key names the
-  service expects. When I say "seal",
-  run `kseal-seal` with the same context, namespace and name. Report its
-  summary. If a key was removed, say so.
+  doesn't exist yet, use `kseal-fetch … --new KEY,KEY` with the key names
+  the service expects. When I say "seal", run `kseal-seal` with the same
+  context, namespace and name. Report its summary. If a key was removed, say
+  so.
+- If a script refuses, report why and stop. Use `--force`, `--no-check` or
+  `--cert` only when I say so.
 - Don't run `kseal get`, `show`, `decode`, `encode` or `gen` yourself, and
   never `kubectl apply` a SealedSecret or `kubectl get secret -o yaml`.
 - Never write a secret value in a command, commit, PR or reply. If one shows
